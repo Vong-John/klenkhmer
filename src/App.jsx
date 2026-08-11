@@ -1,17 +1,10 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
+import { supabase } from "./supabaseClient";
 import {
   Package, Plus, Search, AlertTriangle, Pencil, Trash2, X,
   Boxes, CircleAlert, CircleCheck,
   TrendingUp, ShoppingCart, ArrowDownToLine, ArrowUpFromLine, Layers
 } from "lucide-react";
-
-const PRODUCTS_KEY = "products_v2";
-const TRANSACTIONS_KEY = "transactions_v2";
-
-const emptyForm = {
-  name: "", sku: "", category: "", reorderPoint: "",
-  unitPrice: "", startQty: "", startCost: "", location: "",
-};
 
 function productQty(p) {
   return (p.batches || []).reduce((s, b) => s + b.qtyRemaining, 0);
@@ -53,23 +46,60 @@ function pct(n) {
   return `${(n * 100).toFixed(1)}%`;
 }
 
-function loadJSON(key, fallback) {
-  try {
-    const raw = window.localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
-  } catch (e) {
-    return fallback;
-  }
-}
-
 function startOfToday() { const d = new Date(); d.setHours(0, 0, 0, 0); return d; }
 function startOfWeek() { const d = startOfToday(); d.setDate(d.getDate() - d.getDay()); return d; }
 function startOfMonth() { const d = startOfToday(); d.setDate(1); return d; }
 
+// ---- Shape helpers: convert Supabase rows (snake_case) to the app's existing shape (camelCase) ----
+function mapProductRow(row, batchRows) {
+  return {
+    id: row.id,
+    name: row.name,
+    sku: row.sku,
+    category: row.category,
+    reorderPoint: row.reorder_point,
+    unitPrice: row.unit_price,
+    location: row.location || "",
+    batches: batchRows
+      .filter((b) => b.product_id === row.id)
+      .map((b) => ({
+        id: b.id,
+        date: b.date,
+        qtyReceived: b.qty_received,
+        qtyRemaining: b.qty_remaining,
+        unitCost: b.unit_cost,
+      })),
+  };
+}
+
+function mapTxRow(row) {
+  return {
+    id: row.id,
+    productId: row.product_id,
+    productName: row.product_name,
+    sku: row.sku,
+    type: row.type,
+    batchId: row.batch_id,
+    quantity: row.quantity,
+    unitCost: row.unit_cost,
+    unitPrice: row.unit_price,
+    isPromo: row.is_promo,
+    note: row.note,
+    date: row.date,
+  };
+}
+
+const emptyForm = {
+  name: "", sku: "", category: "", reorderPoint: "",
+  unitPrice: "", startQty: "", startCost: "", location: "",
+};
+
 export default function StockDashboard() {
-  const [products, setProducts] = useState(() => loadJSON(PRODUCTS_KEY, []));
-  const [transactions, setTransactions] = useState(() => loadJSON(TRANSACTIONS_KEY, []));
+  const [products, setProducts] = useState([]);
+  const [transactions, setTransactions] = useState([]);
+  const [loading, setLoading] = useState(true);
   const [saveError, setSaveError] = useState("");
+
   const [search, setSearch] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("All");
   const [statusFilter, setStatusFilter] = useState("All");
@@ -102,25 +132,51 @@ export default function StockDashboard() {
   const [txRange, setTxRange] = useState("all");
   const [view, setView] = useState("inventory");
 
-  function persistProducts(next) {
-    setProducts(next);
-    try {
-      window.localStorage.setItem(PRODUCTS_KEY, JSON.stringify(next));
-      setSaveError("");
-    } catch (e) {
-      setSaveError("Changes aren't saving right now. They'll be lost on refresh.");
+  const [isAdmin, setIsAdmin] = useState(() => sessionStorage.getItem("sd_admin") === "true");
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+
+  function submitLogin(e) {
+    e.preventDefault();
+    if (loginPassword === import.meta.env.VITE_ADMIN_PASSWORD) {
+      sessionStorage.setItem("sd_admin", "true");
+      setIsAdmin(true);
+      setLoginOpen(false);
+      setLoginPassword("");
+      setLoginError("");
+    } else {
+      setLoginError("Wrong password.");
     }
   }
 
-  function persistTransactions(next) {
-    setTransactions(next);
-    try {
-      window.localStorage.setItem(TRANSACTIONS_KEY, JSON.stringify(next));
-      setSaveError("");
-    } catch (e) {
-      setSaveError("Changes aren't saving right now. They'll be lost on refresh.");
-    }
+  function logout() {
+    sessionStorage.removeItem("sd_admin");
+    setIsAdmin(false);
   }
+
+  async function fetchAll() {
+    const [{ data: productRows, error: pErr }, { data: batchRows, error: bErr }, { data: txRows, error: tErr }] =
+      await Promise.all([
+        supabase.from("products").select("*").order("name"),
+        supabase.from("batches").select("*"),
+        supabase.from("transactions").select("*").order("date", { ascending: false }),
+      ]);
+
+    if (pErr || bErr || tErr) {
+      setSaveError((pErr || bErr || tErr).message || "Couldn't load data from the database.");
+      setLoading(false);
+      return;
+    }
+    setSaveError("");
+    setProducts((productRows || []).map((r) => mapProductRow(r, batchRows || [])));
+    setTransactions((txRows || []).map(mapTxRow));
+    setLoading(false);
+  }
+
+  useEffect(() => {
+    fetchAll();
+  }, []);
 
   const categories = useMemo(() => {
     const set = new Set(products.map((p) => p.category).filter(Boolean));
@@ -204,7 +260,7 @@ export default function StockDashboard() {
 
   function closeModal() { setModalOpen(false); setFormError(""); }
 
-  function submitForm(e) {
+  async function submitForm(e) {
     e.preventDefault();
     const name = form.name.trim();
     const sku = form.sku.trim();
@@ -219,48 +275,50 @@ export default function StockDashboard() {
     if (dupe) { setFormError(`SKU "${sku}" is already used by ${dupe.name}.`); return; }
 
     if (editingId) {
-      const next = products.map((p) =>
-        p.id === editingId
-          ? { ...p, name, sku, category: form.category.trim() || "Uncategorized", reorderPoint, unitPrice, location: form.location.trim() }
-          : p
-      );
-      persistProducts(next);
+      const { error } = await supabase.from("products").update({
+        name, sku, category: form.category.trim() || "Uncategorized",
+        reorder_point: reorderPoint, unit_price: unitPrice, location: form.location.trim(),
+      }).eq("id", editingId);
+      if (error) { setFormError(error.message); return; }
     } else {
       const startQty = form.startQty === "" ? 0 : Number(form.startQty);
       const startCost = form.startCost === "" ? 0 : Number(form.startCost);
       if (startQty < 0 || startCost < 0) { setFormError("Starting quantity and cost must be 0 or more."); return; }
-      const newProduct = {
-        id: crypto.randomUUID(), name, sku, category: form.category.trim() || "Uncategorized",
-        reorderPoint, unitPrice, location: form.location.trim(),
-        batches: [],
-      };
-      let nextTransactions = transactions;
+
+      const { data: newProduct, error: pErr } = await supabase.from("products").insert({
+        name, sku, category: form.category.trim() || "Uncategorized",
+        reorder_point: reorderPoint, unit_price: unitPrice, location: form.location.trim(),
+      }).select().single();
+      if (pErr) { setFormError(pErr.message); return; }
+
       if (startQty > 0) {
-        const batchId = crypto.randomUUID();
-        newProduct.batches.push({ id: batchId, date: new Date().toISOString(), qtyReceived: startQty, qtyRemaining: startQty, unitCost: startCost });
-        nextTransactions = [...transactions, {
-          id: crypto.randomUUID(), productId: newProduct.id, productName: name, sku,
-          type: "restock", batchId, quantity: startQty, unitCost: startCost, date: new Date().toISOString(),
-          note: "Starting inventory",
-        }];
+        const { data: newBatch, error: bErr } = await supabase.from("batches").insert({
+          product_id: newProduct.id, qty_received: startQty, qty_remaining: startQty, unit_cost: startCost,
+        }).select().single();
+        if (bErr) { setFormError(bErr.message); return; }
+
+        await supabase.from("transactions").insert({
+          product_id: newProduct.id, product_name: name, sku, type: "restock",
+          batch_id: newBatch.id, quantity: startQty, unit_cost: startCost, note: "Starting inventory",
+        });
       }
-      persistProducts([...products, newProduct]);
-      if (nextTransactions !== transactions) persistTransactions(nextTransactions);
     }
+    await fetchAll();
     setModalOpen(false);
   }
 
-  function deleteProduct(id) {
-    persistProducts(products.filter((p) => p.id !== id));
+  async function deleteProduct(id) {
+    const { error } = await supabase.from("products").delete().eq("id", id);
+    if (error) { setSaveError(error.message); return; }
     setConfirmDeleteId(null);
+    await fetchAll();
   }
 
-  // ---- Stock IN (restock) — creates a new batch ----
   function openRestockModal(p) {
     setRestockModalProduct(p); setRestockQty(""); setRestockCost(""); setRestockError("");
   }
 
-  function submitRestock(e) {
+  async function submitRestock(e) {
     e.preventDefault();
     const qty = Number(restockQty);
     const unitCost = restockCost === "" ? NaN : Number(restockCost);
@@ -268,20 +326,21 @@ export default function StockDashboard() {
     if (restockCost === "" || isNaN(unitCost) || unitCost < 0) { setRestockError("Enter a valid cost (0 or more)."); return; }
 
     const p = restockModalProduct;
-    const batchId = crypto.randomUUID();
-    const newBatch = { id: batchId, date: new Date().toISOString(), qtyReceived: qty, qtyRemaining: qty, unitCost };
-    const nextProducts = products.map((prod) =>
-      prod.id === p.id ? { ...prod, batches: [...(prod.batches || []), newBatch] } : prod
-    );
-    persistProducts(nextProducts);
-    persistTransactions([...transactions, {
-      id: crypto.randomUUID(), productId: p.id, productName: p.name, sku: p.sku,
-      type: "restock", batchId, quantity: qty, unitCost, date: new Date().toISOString(),
-    }]);
+    const { data: newBatch, error: bErr } = await supabase.from("batches").insert({
+      product_id: p.id, qty_received: qty, qty_remaining: qty, unit_cost: unitCost,
+    }).select().single();
+    if (bErr) { setRestockError(bErr.message); return; }
+
+    const { error: tErr } = await supabase.from("transactions").insert({
+      product_id: p.id, product_name: p.name, sku: p.sku, type: "restock",
+      batch_id: newBatch.id, quantity: qty, unit_cost: unitCost,
+    });
+    if (tErr) { setRestockError(tErr.message); return; }
+
+    await fetchAll();
     setRestockModalProduct(null);
   }
 
-  // ---- Stock OUT (sale) — draws from a selected batch ----
   function openSaleModal(p) {
     const available = (p.batches || []).filter((b) => b.qtyRemaining > 0).sort((a, b) => new Date(a.date) - new Date(b.date));
     setSaleModalProduct(p);
@@ -292,7 +351,7 @@ export default function StockDashboard() {
     setSaleError("");
   }
 
-  function submitSale(e) {
+  async function submitSale(e) {
     e.preventDefault();
     const batch = (saleModalProduct.batches || []).find((b) => b.id === selectedBatchId);
     if (!batch) { setSaleError("Select a stock-in batch to sell from."); return; }
@@ -302,39 +361,27 @@ export default function StockDashboard() {
     if (qty > batch.qtyRemaining) { setSaleError(`Only ${batch.qtyRemaining} left in that batch.`); return; }
     if (salePrice === "" || isNaN(price) || price < 0) { setSaleError("Enter a valid sale price (0 or more)."); return; }
 
-    const nextProducts = products.map((p) => {
-      if (p.id !== saleModalProduct.id) return p;
-      return {
-        ...p,
-        batches: p.batches.map((b) => (b.id === batch.id ? { ...b, qtyRemaining: b.qtyRemaining - qty } : b)),
-      };
-    });
-    persistProducts(nextProducts);
+    const { error: bErr } = await supabase.from("batches")
+      .update({ qty_remaining: batch.qtyRemaining - qty })
+      .eq("id", batch.id);
+    if (bErr) { setSaleError(bErr.message); return; }
 
-    const saleRecord = {
-      id: crypto.randomUUID(),
-      productId: saleModalProduct.id,
-      productName: saleModalProduct.name,
-      sku: saleModalProduct.sku,
-      type: "sale",
-      batchId: batch.id,
-      quantity: qty,
-      unitPrice: price,
-      unitCost: batch.unitCost,
-      isPromo: price !== Number(saleModalProduct.unitPrice),
-      note: saleNote.trim(),
-      date: new Date().toISOString(),
-    };
-    persistTransactions([...transactions, saleRecord]);
+    const { error: tErr } = await supabase.from("transactions").insert({
+      product_id: saleModalProduct.id, product_name: saleModalProduct.name, sku: saleModalProduct.sku,
+      type: "sale", batch_id: batch.id, quantity: qty, unit_price: price, unit_cost: batch.unitCost,
+      is_promo: price !== Number(saleModalProduct.unitPrice), note: saleNote.trim(),
+    });
+    if (tErr) { setSaleError(tErr.message); return; }
+
+    await fetchAll();
     setSaleModalProduct(null);
   }
 
-  // ---- Adjustment (shrinkage / correction) — deducts oldest batches first, no cost/margin impact ----
   function openAdjustModal(p) {
     setAdjustModalProduct(p); setAdjustQtyInput(""); setAdjustNote(""); setAdjustError("");
   }
 
-  function submitAdjust(e) {
+  async function submitAdjust(e) {
     e.preventDefault();
     const qty = Number(adjustQtyInput);
     if (!adjustQtyInput || qty <= 0) { setAdjustError("Enter a quantity greater than 0."); return; }
@@ -344,54 +391,59 @@ export default function StockDashboard() {
 
     let remaining = qty;
     const sortedBatches = [...(p.batches || [])].sort((a, b) => new Date(a.date) - new Date(b.date));
-    const updates = {};
     for (const b of sortedBatches) {
       if (remaining <= 0) break;
       const take = Math.min(b.qtyRemaining, remaining);
-      if (take > 0) { updates[b.id] = b.qtyRemaining - take; remaining -= take; }
+      if (take > 0) {
+        const { error } = await supabase.from("batches").update({ qty_remaining: b.qtyRemaining - take }).eq("id", b.id);
+        if (error) { setAdjustError(error.message); return; }
+        remaining -= take;
+      }
     }
-    const nextProducts = products.map((prod) => {
-      if (prod.id !== p.id) return prod;
-      return { ...prod, batches: prod.batches.map((b) => (updates[b.id] !== undefined ? { ...b, qtyRemaining: updates[b.id] } : b)) };
+
+    const { error: tErr } = await supabase.from("transactions").insert({
+      product_id: p.id, product_name: p.name, sku: p.sku, type: "adjustment",
+      quantity: -qty, note: adjustNote.trim() || "Manual correction (loss, damage, miscount)",
     });
-    persistProducts(nextProducts);
-    persistTransactions([...transactions, {
-      id: crypto.randomUUID(), productId: p.id, productName: p.name, sku: p.sku,
-      type: "adjustment", quantity: -qty, date: new Date().toISOString(),
-      note: adjustNote.trim() || "Manual correction (loss, damage, miscount)",
-    }]);
+    if (tErr) { setAdjustError(tErr.message); return; }
+
+    await fetchAll();
     setAdjustModalProduct(null);
   }
 
-  function undoTransaction(tx) {
+  async function undoTransaction(tx) {
     const product = products.find((p) => p.id === tx.productId);
-    if (!product) { persistTransactions(transactions.filter((t) => t.id !== tx.id)); return; }
-
-    let nextProducts = products;
-    if (tx.type === "sale" && tx.batchId) {
-      nextProducts = products.map((p) =>
-        p.id !== tx.productId ? p : { ...p, batches: p.batches.map((b) => (b.id === tx.batchId ? { ...b, qtyRemaining: b.qtyRemaining + tx.quantity } : b)) }
-      );
-    } else if (tx.type === "restock" && tx.batchId) {
-      nextProducts = products.map((p) =>
-        p.id !== tx.productId ? p : { ...p, batches: p.batches.filter((b) => b.id !== tx.batchId) }
-      );
-    } else if (tx.type === "adjustment") {
-      // Restore to the most recently touched batch (best-effort; exact original split isn't tracked).
-      nextProducts = products.map((p) => {
-        if (p.id !== tx.productId || !p.batches?.length) return p;
-        const sorted = [...p.batches].sort((a, b) => new Date(b.date) - new Date(a.date));
+    if (product) {
+      if (tx.type === "sale" && tx.batchId) {
+        const batch = product.batches.find((b) => b.id === tx.batchId);
+        if (batch) {
+          await supabase.from("batches").update({ qty_remaining: batch.qtyRemaining + tx.quantity }).eq("id", batch.id);
+        }
+      } else if (tx.type === "restock" && tx.batchId) {
+        await supabase.from("batches").delete().eq("id", tx.batchId);
+      } else if (tx.type === "adjustment") {
+        const sorted = [...(product.batches || [])].sort((a, b) => new Date(b.date) - new Date(a.date));
         const target = sorted[0];
-        return { ...p, batches: p.batches.map((b) => (b.id === target.id ? { ...b, qtyRemaining: b.qtyRemaining + Math.abs(tx.quantity) } : b)) };
-      });
+        if (target) {
+          await supabase.from("batches").update({ qty_remaining: target.qtyRemaining + Math.abs(tx.quantity) }).eq("id", target.id);
+        }
+      }
     }
-    persistProducts(nextProducts);
-    persistTransactions(transactions.filter((t) => t.id !== tx.id));
+    await supabase.from("transactions").delete().eq("id", tx.id);
+    await fetchAll();
   }
 
   function toggleSort(key) {
     if (sortKey === key) setSortDir(sortDir === "asc" ? "desc" : "asc");
     else { setSortKey(key); setSortDir("asc"); }
+  }
+
+  if (loading) {
+    return (
+      <div style={{ padding: 40, textAlign: "center", color: "#8891a0", fontFamily: "sans-serif" }}>
+        Loading inventory…
+      </div>
+    );
   }
 
   return (
@@ -516,8 +568,38 @@ export default function StockDashboard() {
             <div className="sub sd-mono">{products.length} item{products.length === 1 ? "" : "s"} tracked</div>
           </div>
         </div>
-        <button className="sd-add-btn" onClick={openAdd}><Plus size={16} /> Add Item</button>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {isAdmin ? (
+            <>
+              <button className="sd-add-btn" onClick={openAdd}><Plus size={16} /> Add Item</button>
+              <button className="sd-btn-secondary" onClick={logout}>Log out</button>
+            </>
+          ) : (
+            <button className="sd-btn-secondary" onClick={() => { setLoginOpen(true); setLoginError(""); setLoginPassword(""); }}>
+              Admin login
+            </button>
+          )}
+        </div>
       </div>
+
+      {loginOpen && (
+        <div className="sd-modal-overlay" onClick={() => setLoginOpen(false)}>
+          <div className="sd-modal" style={{ maxWidth: 340 }} onClick={(e) => e.stopPropagation()}>
+            <h2>Admin login</h2>
+            {loginError && <div className="sd-form-error">{loginError}</div>}
+            <form onSubmit={submitLogin}>
+              <div className="sd-field">
+                <label htmlFor="sd-admin-pass">Password</label>
+                <input id="sd-admin-pass" type="password" value={loginPassword} onChange={(e) => setLoginPassword(e.target.value)} autoFocus />
+              </div>
+              <div className="sd-modal-actions">
+                <button type="button" className="sd-btn-secondary" onClick={() => setLoginOpen(false)}>Cancel</button>
+                <button type="submit" className="sd-btn-primary">Log in</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {saveError && <div className="sd-save-error">{saveError}</div>}
 
@@ -581,8 +663,8 @@ export default function StockDashboard() {
             <div className="sd-empty">
               <Package size={40} color="#8891a0" />
               <h3>No items yet</h3>
-              <p>Add your first item to start tracking stock levels.</p>
-              <button className="sd-add-btn" style={{ margin: "10px auto 0" }} onClick={openAdd}><Plus size={16} /> Add Item</button>
+              <p>{isAdmin ? "Add your first item to start tracking stock levels." : "No items yet."}</p>
+              {isAdmin && <button className="sd-add-btn" style={{ margin: "10px auto 0" }} onClick={openAdd}><Plus size={16} /> Add Item</button>}
             </div>
           ) : filtered.length === 0 ? (
             <div className="sd-empty">
@@ -648,22 +730,26 @@ export default function StockDashboard() {
                           <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><Layers size={12} /> {activeBatches}</span>
                         </td>
                         <td>
-                          <div style={{ display: "flex", gap: 2, position: "relative" }}>
-                            <button className="sd-icon-btn restock" onClick={() => openRestockModal(p)} aria-label={`Stock in ${p.name}`} title="Stock in (restock)"><ArrowDownToLine size={14} /></button>
-                            <button className="sd-icon-btn sale" onClick={() => openSaleModal(p)} aria-label={`Stock out ${p.name}`} disabled={qty <= 0} title="Stock out (sale)"><ArrowUpFromLine size={14} /></button>
-                            <button className="sd-icon-btn" onClick={() => openAdjustModal(p)} aria-label={`Adjust ${p.name}`} disabled={qty <= 0} title="Correct stock (loss/damage/miscount)"><AlertTriangle size={14} /></button>
-                            <button className="sd-icon-btn" onClick={() => openEdit(p)} aria-label={`Edit ${p.name}`}><Pencil size={14} /></button>
-                            <button className="sd-icon-btn danger" onClick={() => setConfirmDeleteId(p.id)} aria-label={`Delete ${p.name}`}><Trash2 size={14} /></button>
-                            {confirmDeleteId === p.id && (
-                              <div className="sd-confirm" style={{ right: 0, top: 28 }}>
-                                <div style={{ fontSize: 12, marginBottom: 8, whiteSpace: "nowrap" }}>Delete "{p.name}"?</div>
-                                <div style={{ display: "flex", gap: 6 }}>
-                                  <button className="sd-btn-secondary" style={{ padding: "4px 10px" }} onClick={() => setConfirmDeleteId(null)}>Cancel</button>
-                                  <button className="sd-btn-primary" style={{ padding: "4px 10px", background: "var(--red)" }} onClick={() => deleteProduct(p.id)}>Delete</button>
+                          {isAdmin ? (
+                            <div style={{ display: "flex", gap: 2, position: "relative" }}>
+                              <button className="sd-icon-btn restock" onClick={() => openRestockModal(p)} aria-label={`Stock in ${p.name}`} title="Stock in (restock)"><ArrowDownToLine size={14} /></button>
+                              <button className="sd-icon-btn sale" onClick={() => openSaleModal(p)} aria-label={`Stock out ${p.name}`} disabled={qty <= 0} title="Stock out (sale)"><ArrowUpFromLine size={14} /></button>
+                              <button className="sd-icon-btn" onClick={() => openAdjustModal(p)} aria-label={`Adjust ${p.name}`} disabled={qty <= 0} title="Correct stock (loss/damage/miscount)"><AlertTriangle size={14} /></button>
+                              <button className="sd-icon-btn" onClick={() => openEdit(p)} aria-label={`Edit ${p.name}`}><Pencil size={14} /></button>
+                              <button className="sd-icon-btn danger" onClick={() => setConfirmDeleteId(p.id)} aria-label={`Delete ${p.name}`}><Trash2 size={14} /></button>
+                              {confirmDeleteId === p.id && (
+                                <div className="sd-confirm" style={{ right: 0, top: 28 }}>
+                                  <div style={{ fontSize: 12, marginBottom: 8, whiteSpace: "nowrap" }}>Delete "{p.name}"?</div>
+                                  <div style={{ display: "flex", gap: 6 }}>
+                                    <button className="sd-btn-secondary" style={{ padding: "4px 10px" }} onClick={() => setConfirmDeleteId(null)}>Cancel</button>
+                                    <button className="sd-btn-primary" style={{ padding: "4px 10px", background: "var(--red)" }} onClick={() => deleteProduct(p.id)}>Delete</button>
+                                  </div>
                                 </div>
-                              </div>
-                            )}
-                          </div>
+                              )}
+                            </div>
+                          ) : (
+                            <span style={{ color: "var(--text-muted)", fontSize: 12 }}>—</span>
+                          )}
                         </td>
                       </tr>
                     );
@@ -741,7 +827,9 @@ export default function StockDashboard() {
                           <span style={{ color: "var(--text-muted)", fontSize: 12 }}>{t.note || "—"}</span>
                         </td>
                         <td>
-                          <button className="sd-icon-btn danger" onClick={() => undoTransaction(t)} title="Undo (reverses stock change)"><X size={14} /></button>
+                          {isAdmin && (
+                            <button className="sd-icon-btn danger" onClick={() => undoTransaction(t)} title="Undo (reverses stock change)"><X size={14} /></button>
+                          )}
                         </td>
                       </tr>
                     );
