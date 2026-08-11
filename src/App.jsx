@@ -1,21 +1,34 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useMemo } from "react";
 import {
   Package, Plus, Search, AlertTriangle, Pencil, Trash2, X,
-  ChevronUp, ChevronDown, Boxes, CircleAlert, CircleCheck,
-  DollarSign, TrendingUp, TrendingDown, ShoppingCart, ArrowDownToLine, ArrowUpFromLine
+  Boxes, CircleAlert, CircleCheck,
+  TrendingUp, ShoppingCart, ArrowDownToLine, ArrowUpFromLine, Layers
 } from "lucide-react";
 
-const PRODUCTS_KEY = "products";
-const TRANSACTIONS_KEY = "transactions"; // unified log: restock | sale | adjustment
+const PRODUCTS_KEY = "products_v2";
+const TRANSACTIONS_KEY = "transactions_v2";
 
 const emptyForm = {
-  name: "", sku: "", category: "", quantity: "",
-  reorderPoint: "", unitPrice: "", costPrice: "", location: "",
+  name: "", sku: "", category: "", reorderPoint: "",
+  unitPrice: "", startQty: "", startCost: "", location: "",
 };
 
+function productQty(p) {
+  return (p.batches || []).reduce((s, b) => s + b.qtyRemaining, 0);
+}
+
+function avgCost(p) {
+  const batches = (p.batches || []).filter((b) => b.qtyRemaining > 0);
+  const totalQty = batches.reduce((s, b) => s + b.qtyRemaining, 0);
+  if (totalQty <= 0) return 0;
+  const totalCost = batches.reduce((s, b) => s + b.qtyRemaining * b.unitCost, 0);
+  return totalCost / totalQty;
+}
+
 function statusOf(p) {
-  if (p.quantity <= 0) return "out";
-  if (p.quantity <= p.reorderPoint) return "low";
+  const qty = productQty(p);
+  if (qty <= 0) return "out";
+  if (qty <= p.reorderPoint) return "low";
   return "healthy";
 }
 
@@ -69,13 +82,21 @@ export default function StockDashboard() {
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
   const [saleModalProduct, setSaleModalProduct] = useState(null);
-  const [saleQty, setSaleQty] = useState("1");
+  const [selectedBatchId, setSelectedBatchId] = useState(null);
+  const [saleQty, setSaleQty] = useState("");
+  const [salePrice, setSalePrice] = useState("");
+  const [saleNote, setSaleNote] = useState("");
   const [saleError, setSaleError] = useState("");
 
   const [restockModalProduct, setRestockModalProduct] = useState(null);
   const [restockQty, setRestockQty] = useState("");
   const [restockCost, setRestockCost] = useState("");
   const [restockError, setRestockError] = useState("");
+
+  const [adjustModalProduct, setAdjustModalProduct] = useState(null);
+  const [adjustQtyInput, setAdjustQtyInput] = useState("");
+  const [adjustNote, setAdjustNote] = useState("");
+  const [adjustError, setAdjustError] = useState("");
 
   const [txTypeFilter, setTxTypeFilter] = useState("All");
   const [txRange, setTxRange] = useState("all");
@@ -117,7 +138,10 @@ export default function StockDashboard() {
       return matchesSearch && matchesCategory && matchesStatus;
     });
     list.sort((a, b) => {
-      let av = a[sortKey], bv = b[sortKey];
+      let av, bv;
+      if (sortKey === "quantity") { av = productQty(a); bv = productQty(b); }
+      else if (sortKey === "costPrice") { av = avgCost(a); bv = avgCost(b); }
+      else { av = a[sortKey]; bv = b[sortKey]; }
       if (typeof av === "string") { av = av.toLowerCase(); bv = bv.toLowerCase(); }
       if (av < bv) return sortDir === "asc" ? -1 : 1;
       if (av > bv) return sortDir === "asc" ? 1 : -1;
@@ -127,9 +151,9 @@ export default function StockDashboard() {
   }, [products, search, categoryFilter, statusFilter, sortKey, sortDir]);
 
   const stats = useMemo(() => {
-    const totalUnits = products.reduce((s, p) => s + Number(p.quantity), 0);
-    const totalValue = products.reduce((s, p) => s + Number(p.quantity) * Number(p.unitPrice), 0);
-    const totalCostValue = products.reduce((s, p) => s + Number(p.quantity) * Number(p.costPrice || 0), 0);
+    const totalUnits = products.reduce((s, p) => s + productQty(p), 0);
+    const totalValue = products.reduce((s, p) => s + productQty(p) * Number(p.unitPrice), 0);
+    const totalCostValue = products.reduce((s, p) => s + productQty(p) * avgCost(p), 0);
     const low = products.filter((p) => statusOf(p) === "low").length;
     const out = products.filter((p) => statusOf(p) === "out").length;
     const potentialMargin = totalValue > 0 ? (totalValue - totalCostValue) / totalValue : NaN;
@@ -154,7 +178,7 @@ export default function StockDashboard() {
     const sales = txInRange.filter((t) => t.type === "sale");
     const units = sales.reduce((s, x) => s + x.quantity, 0);
     const revenue = sales.reduce((s, x) => s + x.quantity * x.unitPrice, 0);
-    const cogs = sales.reduce((s, x) => s + x.quantity * (x.unitCostAtSale || 0), 0);
+    const cogs = sales.reduce((s, x) => s + x.quantity * x.unitCost, 0);
     const profit = revenue - cogs;
     const restockSpend = txInRange.filter((t) => t.type === "restock").reduce((s, x) => s + x.quantity * x.unitCost, 0);
     return {
@@ -172,8 +196,8 @@ export default function StockDashboard() {
   function openEdit(p) {
     setForm({
       name: p.name, sku: p.sku, category: p.category,
-      quantity: String(p.quantity), reorderPoint: String(p.reorderPoint),
-      unitPrice: String(p.unitPrice), costPrice: String(p.costPrice ?? ""), location: p.location || "",
+      reorderPoint: String(p.reorderPoint), unitPrice: String(p.unitPrice),
+      startQty: "", startCost: "", location: p.location || "",
     });
     setEditingId(p.id); setFormError(""); setModalOpen(true);
   }
@@ -184,16 +208,12 @@ export default function StockDashboard() {
     e.preventDefault();
     const name = form.name.trim();
     const sku = form.sku.trim();
-    const quantity = Number(form.quantity);
     const reorderPoint = Number(form.reorderPoint);
     const unitPrice = Number(form.unitPrice);
-    const costPrice = form.costPrice === "" ? 0 : Number(form.costPrice);
 
     if (!name || !sku) { setFormError("Item name and SKU are required."); return; }
-    if (form.quantity === "" || quantity < 0) { setFormError("Enter a valid quantity (0 or more)."); return; }
     if (form.reorderPoint === "" || reorderPoint < 0) { setFormError("Enter a valid reorder point (0 or more)."); return; }
     if (form.unitPrice === "" || unitPrice < 0) { setFormError("Enter a valid sell price (0 or more)."); return; }
-    if (costPrice < 0) { setFormError("Enter a valid cost price (0 or more)."); return; }
 
     const dupe = products.find((p) => p.sku.toLowerCase() === sku.toLowerCase() && p.id !== editingId);
     if (dupe) { setFormError(`SKU "${sku}" is already used by ${dupe.name}.`); return; }
@@ -201,34 +221,33 @@ export default function StockDashboard() {
     if (editingId) {
       const next = products.map((p) =>
         p.id === editingId
-          ? { ...p, name, sku, category: form.category.trim() || "Uncategorized", quantity, reorderPoint, unitPrice, costPrice, location: form.location.trim() }
+          ? { ...p, name, sku, category: form.category.trim() || "Uncategorized", reorderPoint, unitPrice, location: form.location.trim() }
           : p
       );
       persistProducts(next);
     } else {
-      const next = [...products, {
+      const startQty = form.startQty === "" ? 0 : Number(form.startQty);
+      const startCost = form.startCost === "" ? 0 : Number(form.startCost);
+      if (startQty < 0 || startCost < 0) { setFormError("Starting quantity and cost must be 0 or more."); return; }
+      const newProduct = {
         id: crypto.randomUUID(), name, sku, category: form.category.trim() || "Uncategorized",
-        quantity, reorderPoint, unitPrice, costPrice, location: form.location.trim(),
-      }];
-      persistProducts(next);
+        reorderPoint, unitPrice, location: form.location.trim(),
+        batches: [],
+      };
+      let nextTransactions = transactions;
+      if (startQty > 0) {
+        const batchId = crypto.randomUUID();
+        newProduct.batches.push({ id: batchId, date: new Date().toISOString(), qtyReceived: startQty, qtyRemaining: startQty, unitCost: startCost });
+        nextTransactions = [...transactions, {
+          id: crypto.randomUUID(), productId: newProduct.id, productName: name, sku,
+          type: "restock", batchId, quantity: startQty, unitCost: startCost, date: new Date().toISOString(),
+          note: "Starting inventory",
+        }];
+      }
+      persistProducts([...products, newProduct]);
+      if (nextTransactions !== transactions) persistTransactions(nextTransactions);
     }
     setModalOpen(false);
-  }
-
-  // Quick +/- stays for minor corrections (damaged, miscount) — logged as an adjustment, no cost impact.
-  function adjustQty(id, delta) {
-    const product = products.find((p) => p.id === id);
-    if (!product) return;
-    const newQty = Math.max(0, Number(product.quantity) + delta);
-    const actualDelta = newQty - product.quantity;
-    if (actualDelta === 0) return;
-    const next = products.map((p) => (p.id === id ? { ...p, quantity: newQty } : p));
-    persistProducts(next);
-    persistTransactions([...transactions, {
-      id: crypto.randomUUID(), productId: id, productName: product.name, sku: product.sku,
-      type: "adjustment", quantity: actualDelta, date: new Date().toISOString(),
-      note: "Manual quantity adjustment",
-    }]);
   }
 
   function deleteProduct(id) {
@@ -236,50 +255,60 @@ export default function StockDashboard() {
     setConfirmDeleteId(null);
   }
 
-  // ---- Stock IN (restock) ----
+  // ---- Stock IN (restock) — creates a new batch ----
   function openRestockModal(p) {
-    setRestockModalProduct(p); setRestockQty(""); setRestockCost(String(p.costPrice ?? "")); setRestockError("");
+    setRestockModalProduct(p); setRestockQty(""); setRestockCost(""); setRestockError("");
   }
 
   function submitRestock(e) {
     e.preventDefault();
     const qty = Number(restockQty);
-    const unitCost = restockCost === "" ? 0 : Number(restockCost);
+    const unitCost = restockCost === "" ? NaN : Number(restockCost);
     if (!restockQty || qty <= 0) { setRestockError("Enter a quantity greater than 0."); return; }
-    if (unitCost < 0) { setRestockError("Enter a valid cost (0 or more)."); return; }
+    if (restockCost === "" || isNaN(unitCost) || unitCost < 0) { setRestockError("Enter a valid cost (0 or more)."); return; }
 
     const p = restockModalProduct;
-    const oldQty = Number(p.quantity);
-    const oldCost = Number(p.costPrice || 0);
-    // Weighted average cost across old stock + incoming stock.
-    const newQty = oldQty + qty;
-    const newCostPrice = newQty > 0 ? ((oldQty * oldCost) + (qty * unitCost)) / newQty : unitCost;
-
+    const batchId = crypto.randomUUID();
+    const newBatch = { id: batchId, date: new Date().toISOString(), qtyReceived: qty, qtyRemaining: qty, unitCost };
     const nextProducts = products.map((prod) =>
-      prod.id === p.id ? { ...prod, quantity: newQty, costPrice: newCostPrice } : prod
+      prod.id === p.id ? { ...prod, batches: [...(prod.batches || []), newBatch] } : prod
     );
     persistProducts(nextProducts);
     persistTransactions([...transactions, {
       id: crypto.randomUUID(), productId: p.id, productName: p.name, sku: p.sku,
-      type: "restock", quantity: qty, unitCost, date: new Date().toISOString(),
+      type: "restock", batchId, quantity: qty, unitCost, date: new Date().toISOString(),
     }]);
     setRestockModalProduct(null);
   }
 
-  // ---- Stock OUT (sale) ----
+  // ---- Stock OUT (sale) — draws from a selected batch ----
   function openSaleModal(p) {
-    setSaleModalProduct(p); setSaleQty("1"); setSaleError("");
+    const available = (p.batches || []).filter((b) => b.qtyRemaining > 0).sort((a, b) => new Date(a.date) - new Date(b.date));
+    setSaleModalProduct(p);
+    setSelectedBatchId(available[0]?.id || null);
+    setSaleQty("");
+    setSalePrice(String(p.unitPrice));
+    setSaleNote("");
+    setSaleError("");
   }
 
   function submitSale(e) {
     e.preventDefault();
+    const batch = (saleModalProduct.batches || []).find((b) => b.id === selectedBatchId);
+    if (!batch) { setSaleError("Select a stock-in batch to sell from."); return; }
     const qty = Number(saleQty);
+    const price = salePrice === "" ? NaN : Number(salePrice);
     if (!saleQty || qty <= 0) { setSaleError("Enter a quantity greater than 0."); return; }
-    if (qty > saleModalProduct.quantity) { setSaleError(`Only ${saleModalProduct.quantity} in stock.`); return; }
+    if (qty > batch.qtyRemaining) { setSaleError(`Only ${batch.qtyRemaining} left in that batch.`); return; }
+    if (salePrice === "" || isNaN(price) || price < 0) { setSaleError("Enter a valid sale price (0 or more)."); return; }
 
-    const nextProducts = products.map((p) =>
-      p.id === saleModalProduct.id ? { ...p, quantity: p.quantity - qty } : p
-    );
+    const nextProducts = products.map((p) => {
+      if (p.id !== saleModalProduct.id) return p;
+      return {
+        ...p,
+        batches: p.batches.map((b) => (b.id === batch.id ? { ...b, qtyRemaining: b.qtyRemaining - qty } : b)),
+      };
+    });
     persistProducts(nextProducts);
 
     const saleRecord = {
@@ -288,24 +317,74 @@ export default function StockDashboard() {
       productName: saleModalProduct.name,
       sku: saleModalProduct.sku,
       type: "sale",
+      batchId: batch.id,
       quantity: qty,
-      unitPrice: saleModalProduct.unitPrice,
-      unitCostAtSale: Number(saleModalProduct.costPrice || 0), // lock in cost at time of sale for accurate margin history
+      unitPrice: price,
+      unitCost: batch.unitCost,
+      isPromo: price !== Number(saleModalProduct.unitPrice),
+      note: saleNote.trim(),
       date: new Date().toISOString(),
     };
     persistTransactions([...transactions, saleRecord]);
     setSaleModalProduct(null);
   }
 
+  // ---- Adjustment (shrinkage / correction) — deducts oldest batches first, no cost/margin impact ----
+  function openAdjustModal(p) {
+    setAdjustModalProduct(p); setAdjustQtyInput(""); setAdjustNote(""); setAdjustError("");
+  }
+
+  function submitAdjust(e) {
+    e.preventDefault();
+    const qty = Number(adjustQtyInput);
+    if (!adjustQtyInput || qty <= 0) { setAdjustError("Enter a quantity greater than 0."); return; }
+    const p = adjustModalProduct;
+    const currentQty = productQty(p);
+    if (qty > currentQty) { setAdjustError(`Only ${currentQty} in stock.`); return; }
+
+    let remaining = qty;
+    const sortedBatches = [...(p.batches || [])].sort((a, b) => new Date(a.date) - new Date(b.date));
+    const updates = {};
+    for (const b of sortedBatches) {
+      if (remaining <= 0) break;
+      const take = Math.min(b.qtyRemaining, remaining);
+      if (take > 0) { updates[b.id] = b.qtyRemaining - take; remaining -= take; }
+    }
+    const nextProducts = products.map((prod) => {
+      if (prod.id !== p.id) return prod;
+      return { ...prod, batches: prod.batches.map((b) => (updates[b.id] !== undefined ? { ...b, qtyRemaining: updates[b.id] } : b)) };
+    });
+    persistProducts(nextProducts);
+    persistTransactions([...transactions, {
+      id: crypto.randomUUID(), productId: p.id, productName: p.name, sku: p.sku,
+      type: "adjustment", quantity: -qty, date: new Date().toISOString(),
+      note: adjustNote.trim() || "Manual correction (loss, damage, miscount)",
+    }]);
+    setAdjustModalProduct(null);
+  }
+
   function undoTransaction(tx) {
     const product = products.find((p) => p.id === tx.productId);
     if (!product) { persistTransactions(transactions.filter((t) => t.id !== tx.id)); return; }
-    let nextQty = product.quantity;
-    if (tx.type === "sale") nextQty += tx.quantity;
-    if (tx.type === "restock") nextQty -= tx.quantity;
-    if (tx.type === "adjustment") nextQty -= tx.quantity;
-    nextQty = Math.max(0, nextQty);
-    const nextProducts = products.map((p) => (p.id === tx.productId ? { ...p, quantity: nextQty } : p));
+
+    let nextProducts = products;
+    if (tx.type === "sale" && tx.batchId) {
+      nextProducts = products.map((p) =>
+        p.id !== tx.productId ? p : { ...p, batches: p.batches.map((b) => (b.id === tx.batchId ? { ...b, qtyRemaining: b.qtyRemaining + tx.quantity } : b)) }
+      );
+    } else if (tx.type === "restock" && tx.batchId) {
+      nextProducts = products.map((p) =>
+        p.id !== tx.productId ? p : { ...p, batches: p.batches.filter((b) => b.id !== tx.batchId) }
+      );
+    } else if (tx.type === "adjustment") {
+      // Restore to the most recently touched batch (best-effort; exact original split isn't tracked).
+      nextProducts = products.map((p) => {
+        if (p.id !== tx.productId || !p.batches?.length) return p;
+        const sorted = [...p.batches].sort((a, b) => new Date(b.date) - new Date(a.date));
+        const target = sorted[0];
+        return { ...p, batches: p.batches.map((b) => (b.id === target.id ? { ...b, qtyRemaining: b.qtyRemaining + Math.abs(tx.quantity) } : b)) };
+      });
+    }
     persistProducts(nextProducts);
     persistTransactions(transactions.filter((t) => t.id !== tx.id));
   }
@@ -386,11 +465,6 @@ export default function StockDashboard() {
 
         .sd-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
 
-        .sd-qty-controls { display: flex; align-items: center; gap: 6px; }
-        .sd-qty-btn { width: 22px; height: 22px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; display: flex; align-items: center; justify-content: center; }
-        .sd-qty-btn:hover { border-color: var(--amber); }
-        .sd-qty-btn:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
-
         .sd-icon-btn { background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: 4px; border-radius: 4px; }
         .sd-icon-btn:hover { color: var(--text); background: var(--surface-2); }
         .sd-icon-btn.danger:hover { color: var(--red); }
@@ -402,7 +476,7 @@ export default function StockDashboard() {
         .sd-empty h3 { color: var(--text); font-family: 'Oswald', sans-serif; text-transform: uppercase; margin: 12px 0 6px; }
 
         .sd-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 16px; }
-        .sd-modal { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 22px; width: 100%; max-width: 420px; max-height: 90vh; overflow-y: auto; }
+        .sd-modal { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 22px; width: 100%; max-width: 460px; max-height: 90vh; overflow-y: auto; }
         .sd-modal h2 { font-family: 'Oswald', sans-serif; text-transform: uppercase; font-size: 18px; margin: 0 0 16px; }
         .sd-field { margin-bottom: 12px; }
         .sd-field label { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
@@ -413,6 +487,7 @@ export default function StockDashboard() {
         .sd-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
         .sd-btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
         .sd-btn-primary { background: var(--amber); border: none; color: #14161c; font-weight: 600; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+        .sd-btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 
         .sd-confirm { position: absolute; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; z-index: 10; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
         .sd-save-error { background: rgba(229,72,77,0.12); color: var(--red); border: 1px solid rgba(229,72,77,0.3); padding: 8px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 16px; }
@@ -426,6 +501,11 @@ export default function StockDashboard() {
         .sd-range-btn.active { background: var(--surface-2); color: var(--amber); border-color: var(--amber); }
 
         .sd-cost-hint { font-size: 11px; color: var(--text-muted); margin-top: -6px; margin-bottom: 12px; }
+
+        .sd-batch-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; max-height: 180px; overflow-y: auto; }
+        .sd-batch-option { display: flex; justify-content: space-between; align-items: center; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; cursor: pointer; font-size: 13px; }
+        .sd-batch-option.selected { border-color: var(--amber); background: rgba(242,169,59,0.08); }
+        .sd-batch-option input { width: auto; margin-right: 8px; }
       `}</style>
 
       <div className="sd-header">
@@ -458,7 +538,7 @@ export default function StockDashboard() {
               <div className="sd-ticker-track">
                 <div className="sd-ticker-inner">
                   {Array(2).fill(criticalItems.map((p) =>
-                    `${statusOf(p) === "out" ? "OUT OF STOCK" : "REORDER"}: ${p.name} (${p.sku}) — ${p.quantity} units`
+                    `${statusOf(p) === "out" ? "OUT OF STOCK" : "REORDER"}: ${p.name} (${p.sku}) — ${productQty(p)} units`
                   ).join("   //   ")).join("   //   ")}
                 </div>
               </div>
@@ -520,9 +600,10 @@ export default function StockDashboard() {
                     <SortTh label="Category" k="category" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
                     <SortTh label="Stock" k="quantity" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
                     <th>Status</th>
-                    <SortTh label="Cost" k="costPrice" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                    <SortTh label="Avg cost" k="costPrice" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
                     <SortTh label="Sell" k="unitPrice" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
                     <th>Margin</th>
+                    <th>Batches</th>
                     <th></th>
                   </tr>
                 </thead>
@@ -530,10 +611,12 @@ export default function StockDashboard() {
                   {filtered.map((p) => {
                     const status = statusOf(p);
                     const meta = STATUS_META[status];
-                    const max = Math.max(p.reorderPoint * 2, p.quantity, 1);
-                    const gaugePct = Math.min(100, (p.quantity / max) * 100);
-                    const cost = Number(p.costPrice || 0);
+                    const qty = productQty(p);
+                    const max = Math.max(p.reorderPoint * 2, qty, 1);
+                    const gaugePct = Math.min(100, (qty / max) * 100);
+                    const cost = avgCost(p);
                     const marginPct = p.unitPrice > 0 ? (p.unitPrice - cost) / p.unitPrice : NaN;
+                    const activeBatches = (p.batches || []).filter((b) => b.qtyRemaining > 0).length;
                     return (
                       <tr key={p.id}>
                         <td>
@@ -543,11 +626,7 @@ export default function StockDashboard() {
                         <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{p.sku}</td>
                         <td>{p.category}</td>
                         <td>
-                          <div className="sd-qty-controls">
-                            <button className="sd-qty-btn" onClick={() => adjustQty(p.id, -1)} aria-label={`Decrease ${p.name} quantity`}><ChevronDown size={13} /></button>
-                            <span className="sd-mono" style={{ minWidth: 28, textAlign: "center" }}>{p.quantity}</span>
-                            <button className="sd-qty-btn" onClick={() => adjustQty(p.id, 1)} aria-label={`Increase ${p.name} quantity`}><ChevronUp size={13} /></button>
-                          </div>
+                          <div className="sd-mono">{qty}</div>
                           <div className="sd-gauge-wrap" style={{ marginTop: 6 }}>
                             <div className="sd-gauge"><div className="sd-gauge-fill" style={{ width: `${gaugePct}%`, background: meta.color }} /></div>
                           </div>
@@ -565,10 +644,14 @@ export default function StockDashboard() {
                         <td className="sd-mono" style={{ color: !isFinite(marginPct) ? "var(--text-muted)" : marginPct < 0 ? "var(--red)" : "var(--teal)" }}>
                           {pct(marginPct)}
                         </td>
+                        <td className="sd-mono" style={{ color: "var(--text-muted)" }}>
+                          <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><Layers size={12} /> {activeBatches}</span>
+                        </td>
                         <td>
                           <div style={{ display: "flex", gap: 2, position: "relative" }}>
-                            <button className="sd-icon-btn restock" onClick={() => openRestockModal(p)} aria-label={`Restock ${p.name}`} title="Stock in (restock)"><ArrowDownToLine size={14} /></button>
-                            <button className="sd-icon-btn sale" onClick={() => openSaleModal(p)} aria-label={`Record sale of ${p.name}`} disabled={p.quantity <= 0} title="Stock out (sale)"><ArrowUpFromLine size={14} /></button>
+                            <button className="sd-icon-btn restock" onClick={() => openRestockModal(p)} aria-label={`Stock in ${p.name}`} title="Stock in (restock)"><ArrowDownToLine size={14} /></button>
+                            <button className="sd-icon-btn sale" onClick={() => openSaleModal(p)} aria-label={`Stock out ${p.name}`} disabled={qty <= 0} title="Stock out (sale)"><ArrowUpFromLine size={14} /></button>
+                            <button className="sd-icon-btn" onClick={() => openAdjustModal(p)} aria-label={`Adjust ${p.name}`} disabled={qty <= 0} title="Correct stock (loss/damage/miscount)"><AlertTriangle size={14} /></button>
                             <button className="sd-icon-btn" onClick={() => openEdit(p)} aria-label={`Edit ${p.name}`}><Pencil size={14} /></button>
                             <button className="sd-icon-btn danger" onClick={() => setConfirmDeleteId(p.id)} aria-label={`Delete ${p.name}`}><Trash2 size={14} /></button>
                             {confirmDeleteId === p.id && (
@@ -622,14 +705,14 @@ export default function StockDashboard() {
             <div className="sd-empty">
               <ShoppingCart size={36} color="#8891a0" />
               <h3>No activity in this range</h3>
-              <p>Use the arrow icons next to an item in Inventory to log stock in or stock out.</p>
+              <p>Use the icons next to an item in Inventory to log stock in or stock out.</p>
             </div>
           ) : (
             <div className="sd-table-wrap">
               <table className="sd-table">
                 <thead>
                   <tr>
-                    <th>Date</th><th>Type</th><th>Item</th><th>SKU</th><th>Qty</th><th>Unit</th><th>Total</th><th>Profit</th><th></th>
+                    <th>Date</th><th>Type</th><th>Item</th><th>SKU</th><th>Qty</th><th>Cost</th><th>Sell price</th><th>Total</th><th>Margin</th><th>Note</th><th></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -637,9 +720,9 @@ export default function StockDashboard() {
                     const meta = TX_META[t.type];
                     const isSale = t.type === "sale";
                     const isRestock = t.type === "restock";
-                    const unit = isSale ? t.unitPrice : isRestock ? t.unitCost : null;
                     const total = isSale ? t.quantity * t.unitPrice : isRestock ? t.quantity * t.unitCost : null;
-                    const profit = isSale ? (t.unitPrice - (t.unitCostAtSale || 0)) * t.quantity : null;
+                    const profit = isSale ? (t.unitPrice - t.unitCost) * t.quantity : null;
+                    const marginPct = isSale && t.unitPrice > 0 ? (t.unitPrice - t.unitCost) / t.unitPrice : NaN;
                     return (
                       <tr key={t.id}>
                         <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{new Date(t.date).toLocaleString()}</td>
@@ -647,10 +730,15 @@ export default function StockDashboard() {
                         <td style={{ fontWeight: 600 }}>{t.productName}</td>
                         <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{t.sku}</td>
                         <td className="sd-mono">{meta.sign}{t.quantity}</td>
-                        <td className="sd-mono">{unit != null ? currency(unit) : "—"}</td>
+                        <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{isSale || isRestock ? currency(t.unitCost) : "—"}</td>
+                        <td className="sd-mono">{isSale ? currency(t.unitPrice) : "—"}</td>
                         <td className="sd-mono">{total != null ? currency(total) : "—"}</td>
                         <td className="sd-mono" style={{ color: profit == null ? "var(--text-muted)" : profit < 0 ? "var(--red)" : "var(--teal)" }}>
-                          {profit != null ? currency(profit) : "—"}
+                          {profit != null ? `${currency(profit)} (${pct(marginPct)})` : "—"}
+                        </td>
+                        <td style={{ maxWidth: 180 }}>
+                          {isSale && t.isPromo && <span className="sd-badge" style={{ color: "var(--amber)", background: "rgba(242,169,59,0.14)", marginRight: 6 }}>Promo</span>}
+                          <span style={{ color: "var(--text-muted)", fontSize: 12 }}>{t.note || "—"}</span>
                         </td>
                         <td>
                           <button className="sd-icon-btn danger" onClick={() => undoTransaction(t)} title="Undo (reverses stock change)"><X size={14} /></button>
@@ -687,25 +775,28 @@ export default function StockDashboard() {
               </div>
               <div className="sd-field-row">
                 <div className="sd-field">
-                  <label htmlFor="sd-qty">Quantity on hand</label>
-                  <input id="sd-qty" type="number" min="0" value={form.quantity} onChange={(e) => setForm({ ...form, quantity: e.target.value })} placeholder="0" />
-                </div>
-                <div className="sd-field">
                   <label htmlFor="sd-reorder">Reorder point</label>
                   <input id="sd-reorder" type="number" min="0" value={form.reorderPoint} onChange={(e) => setForm({ ...form, reorderPoint: e.target.value })} placeholder="0" />
-                </div>
-              </div>
-              <div className="sd-field-row">
-                <div className="sd-field">
-                  <label htmlFor="sd-cost">Cost price</label>
-                  <input id="sd-cost" type="number" min="0" step="0.01" value={form.costPrice} onChange={(e) => setForm({ ...form, costPrice: e.target.value })} placeholder="0.00" />
                 </div>
                 <div className="sd-field">
                   <label htmlFor="sd-price">Sell price</label>
                   <input id="sd-price" type="number" min="0" step="0.01" value={form.unitPrice} onChange={(e) => setForm({ ...form, unitPrice: e.target.value })} placeholder="0.00" />
                 </div>
               </div>
-              <div className="sd-cost-hint">Once stock is moving, cost price is auto-updated (weighted average) whenever you restock — you won't usually need to edit it here after that.</div>
+              {!editingId && (
+                <div className="sd-field-row">
+                  <div className="sd-field">
+                    <label htmlFor="sd-start-qty">Starting quantity</label>
+                    <input id="sd-start-qty" type="number" min="0" value={form.startQty} onChange={(e) => setForm({ ...form, startQty: e.target.value })} placeholder="0" />
+                  </div>
+                  <div className="sd-field">
+                    <label htmlFor="sd-start-cost">Starting cost/unit</label>
+                    <input id="sd-start-cost" type="number" min="0" step="0.01" value={form.startCost} onChange={(e) => setForm({ ...form, startCost: e.target.value })} placeholder="0.00" />
+                  </div>
+                </div>
+              )}
+              {!editingId && <div className="sd-cost-hint">This creates your first stock-in batch. Add more later via "Stock in" on the item row — each restock is tracked as its own batch with its own cost.</div>}
+              {editingId && <div className="sd-cost-hint">Quantity and cost are managed per-batch — use "Stock in" / "Stock out" on the item row to change stock.</div>}
               <div className="sd-field">
                 <label htmlFor="sd-loc">Location (optional)</label>
                 <input id="sd-loc" value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} placeholder="Aisle 3, Bin 4" />
@@ -722,11 +813,10 @@ export default function StockDashboard() {
       {restockModalProduct && (
         <div className="sd-modal-overlay" onClick={() => setRestockModalProduct(null)}>
           <div className="sd-modal" onClick={(e) => e.stopPropagation()}>
-            <h2>Stock in — restock</h2>
+            <h2>Stock in — new batch</h2>
             {restockError && <div className="sd-form-error">{restockError}</div>}
             <div className="sd-sale-summary">
-              <div className="row"><span>{restockModalProduct.name}</span><span className="sd-mono">{restockModalProduct.quantity} in stock</span></div>
-              <div className="row" style={{ color: "var(--text-muted)", fontWeight: 400 }}><span>Current avg. cost</span><span className="sd-mono">{currency(restockModalProduct.costPrice || 0)}</span></div>
+              <div className="row"><span>{restockModalProduct.name}</span><span className="sd-mono">{productQty(restockModalProduct)} in stock</span></div>
             </div>
             <form onSubmit={submitRestock}>
               <div className="sd-field-row">
@@ -739,17 +829,7 @@ export default function StockDashboard() {
                   <input id="sd-restock-cost" type="number" min="0" step="0.01" value={restockCost} onChange={(e) => setRestockCost(e.target.value)} placeholder="0.00" />
                 </div>
               </div>
-              <div className="sd-cost-hint">
-                {restockQty && restockCost !== "" ? (() => {
-                  const oldQty = Number(restockModalProduct.quantity);
-                  const oldCost = Number(restockModalProduct.costPrice || 0);
-                  const qty = Number(restockQty) || 0;
-                  const unitCost = Number(restockCost) || 0;
-                  const newQty = oldQty + qty;
-                  const newCost = newQty > 0 ? ((oldQty * oldCost) + (qty * unitCost)) / newQty : unitCost;
-                  return `New weighted average cost will be ${currency(newCost)} across ${newQty} units.`;
-                })() : "Enter quantity and cost to preview the new average cost."}
-              </div>
+              <div className="sd-cost-hint">This creates a new batch at this cost. When you record a sale, you'll pick which batch it comes from.</div>
               <div className="sd-modal-actions">
                 <button type="button" className="sd-btn-secondary" onClick={() => setRestockModalProduct(null)}>Cancel</button>
                 <button type="submit" className="sd-btn-primary">Add stock</button>
@@ -759,27 +839,94 @@ export default function StockDashboard() {
         </div>
       )}
 
-      {saleModalProduct && (
-        <div className="sd-modal-overlay" onClick={() => setSaleModalProduct(null)}>
-          <div className="sd-modal" onClick={(e) => e.stopPropagation()}>
-            <h2>Stock out — sale</h2>
-            {saleError && <div className="sd-form-error">{saleError}</div>}
-            <div className="sd-sale-summary">
-              <div className="row"><span>{saleModalProduct.name}</span><span className="sd-mono">{saleModalProduct.quantity} in stock</span></div>
-            </div>
-            <form onSubmit={submitSale}>
-              <div className="sd-field">
-                <label htmlFor="sd-sale-qty">Quantity sold</label>
-                <input id="sd-sale-qty" type="number" min="1" max={saleModalProduct.quantity} value={saleQty} onChange={(e) => setSaleQty(e.target.value)} autoFocus />
-              </div>
+      {saleModalProduct && (() => {
+        const available = (saleModalProduct.batches || []).filter((b) => b.qtyRemaining > 0).sort((a, b) => new Date(a.date) - new Date(b.date));
+        const batch = available.find((b) => b.id === selectedBatchId);
+        return (
+          <div className="sd-modal-overlay" onClick={() => setSaleModalProduct(null)}>
+            <div className="sd-modal" onClick={(e) => e.stopPropagation()}>
+              <h2>Stock out — sale</h2>
+              {saleError && <div className="sd-form-error">{saleError}</div>}
               <div className="sd-sale-summary">
-                <div className="row"><span>Sell price</span><span className="sd-mono">{currency(saleModalProduct.unitPrice)}</span></div>
-                <div className="row" style={{ color: "var(--text-muted)", fontWeight: 400 }}><span>Cost price</span><span className="sd-mono">{currency(saleModalProduct.costPrice || 0)}</span></div>
-                <div className="row"><span>Profit</span><span className="sd-mono">{currency(((Number(saleQty) || 0)) * (saleModalProduct.unitPrice - Number(saleModalProduct.costPrice || 0)))}</span></div>
+                <div className="row"><span>{saleModalProduct.name}</span><span className="sd-mono">{productQty(saleModalProduct)} in stock</span></div>
+              </div>
+
+              {available.length === 0 ? (
+                <div className="sd-form-error">No stock-in batches available to sell from.</div>
+              ) : (
+                <form onSubmit={submitSale}>
+                  <div className="sd-field">
+                    <label>Select batch to sell from</label>
+                    <div className="sd-batch-list">
+                      {available.map((b) => (
+                        <label key={b.id} className={`sd-batch-option ${selectedBatchId === b.id ? "selected" : ""}`}>
+                          <div style={{ display: "flex", alignItems: "center" }}>
+                            <input type="radio" name="batch" checked={selectedBatchId === b.id} onChange={() => setSelectedBatchId(b.id)} />
+                            <span>{new Date(b.date).toLocaleDateString()} — {b.qtyRemaining} left</span>
+                          </div>
+                          <span className="sd-mono" style={{ color: "var(--text-muted)" }}>cost {currency(b.unitCost)}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="sd-field-row">
+                    <div className="sd-field">
+                      <label htmlFor="sd-sale-qty">Quantity sold</label>
+                      <input id="sd-sale-qty" type="number" min="1" max={batch?.qtyRemaining || 1} value={saleQty} onChange={(e) => setSaleQty(e.target.value)} />
+                    </div>
+                    <div className="sd-field">
+                      <label htmlFor="sd-sale-price">Price charged</label>
+                      <input id="sd-sale-price" type="number" min="0" step="0.01" value={salePrice} onChange={(e) => setSalePrice(e.target.value)} placeholder="0.00" />
+                    </div>
+                  </div>
+                  {salePrice !== "" && Number(salePrice) !== Number(saleModalProduct.unitPrice) && (
+                    <div className="sd-cost-hint" style={{ color: "var(--amber)" }}>
+                      Catalog price is {currency(saleModalProduct.unitPrice)} — this will be logged as a promo/discounted sale.
+                    </div>
+                  )}
+                  <div className="sd-field">
+                    <label htmlFor="sd-sale-note">Remark (optional)</label>
+                    <input id="sd-sale-note" value={saleNote} onChange={(e) => setSaleNote(e.target.value)} placeholder="e.g. Rainy season promo, wholesale to reseller" />
+                  </div>
+                  {batch && (
+                    <div className="sd-sale-summary">
+                      <div className="row" style={{ color: "var(--text-muted)", fontWeight: 400 }}><span>Cost (this batch)</span><span className="sd-mono">{currency(batch.unitCost)}</span></div>
+                      <div className="row"><span>Profit</span><span className="sd-mono">{currency(((Number(saleQty) || 0)) * ((Number(salePrice) || 0) - batch.unitCost))}</span></div>
+                    </div>
+                  )}
+                  <div className="sd-modal-actions">
+                    <button type="button" className="sd-btn-secondary" onClick={() => setSaleModalProduct(null)}>Cancel</button>
+                    <button type="submit" className="sd-btn-primary" disabled={!batch}>Record sale</button>
+                  </div>
+                </form>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
+      {adjustModalProduct && (
+        <div className="sd-modal-overlay" onClick={() => setAdjustModalProduct(null)}>
+          <div className="sd-modal" onClick={(e) => e.stopPropagation()}>
+            <h2>Correct stock</h2>
+            {adjustError && <div className="sd-form-error">{adjustError}</div>}
+            <div className="sd-sale-summary">
+              <div className="row"><span>{adjustModalProduct.name}</span><span className="sd-mono">{productQty(adjustModalProduct)} in stock</span></div>
+            </div>
+            <div className="sd-cost-hint">For loss, damage, or miscounts — not sales. Deducts from your oldest batches first and does not affect revenue or margin.</div>
+            <form onSubmit={submitAdjust}>
+              <div className="sd-field">
+                <label htmlFor="sd-adjust-qty">Quantity to remove</label>
+                <input id="sd-adjust-qty" type="number" min="1" max={productQty(adjustModalProduct)} value={adjustQtyInput} onChange={(e) => setAdjustQtyInput(e.target.value)} autoFocus />
+              </div>
+              <div className="sd-field">
+                <label htmlFor="sd-adjust-note">Reason</label>
+                <input id="sd-adjust-note" value={adjustNote} onChange={(e) => setAdjustNote(e.target.value)} placeholder="e.g. Damaged in storage, miscount" />
               </div>
               <div className="sd-modal-actions">
-                <button type="button" className="sd-btn-secondary" onClick={() => setSaleModalProduct(null)}>Cancel</button>
-                <button type="submit" className="sd-btn-primary">Record sale</button>
+                <button type="button" className="sd-btn-secondary" onClick={() => setAdjustModalProduct(null)}>Cancel</button>
+                <button type="submit" className="sd-btn-primary">Apply correction</button>
               </div>
             </form>
           </div>
