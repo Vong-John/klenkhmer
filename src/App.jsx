@@ -2,15 +2,15 @@ import { useState, useEffect, useMemo } from "react";
 import {
   Package, Plus, Search, AlertTriangle, Pencil, Trash2, X,
   ChevronUp, ChevronDown, Boxes, CircleAlert, CircleCheck,
-  DollarSign, TrendingUp, ShoppingCart
+  DollarSign, TrendingUp, TrendingDown, ShoppingCart, ArrowDownToLine, ArrowUpFromLine
 } from "lucide-react";
 
 const PRODUCTS_KEY = "products";
-const SALES_KEY = "sales";
+const TRANSACTIONS_KEY = "transactions"; // unified log: restock | sale | adjustment
 
 const emptyForm = {
   name: "", sku: "", category: "", quantity: "",
-  reorderPoint: "", unitPrice: "", location: "",
+  reorderPoint: "", unitPrice: "", costPrice: "", location: "",
 };
 
 function statusOf(p) {
@@ -25,8 +25,19 @@ const STATUS_META = {
   healthy: { label: "Healthy", color: "var(--teal)", bg: "rgba(62,207,142,0.14)" },
 };
 
+const TX_META = {
+  restock: { label: "Stock in", color: "var(--teal)", bg: "rgba(62,207,142,0.14)", sign: "+" },
+  sale: { label: "Stock out", color: "var(--amber)", bg: "rgba(242,169,59,0.14)", sign: "-" },
+  adjustment: { label: "Adjustment", color: "#8891a0", bg: "rgba(136,145,160,0.14)", sign: "" },
+};
+
 function currency(n) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n || 0);
+}
+
+function pct(n) {
+  if (!isFinite(n)) return "—";
+  return `${(n * 100).toFixed(1)}%`;
 }
 
 function loadJSON(key, fallback) {
@@ -44,7 +55,7 @@ function startOfMonth() { const d = startOfToday(); d.setDate(1); return d; }
 
 export default function StockDashboard() {
   const [products, setProducts] = useState(() => loadJSON(PRODUCTS_KEY, []));
-  const [sales, setSales] = useState(() => loadJSON(SALES_KEY, []));
+  const [transactions, setTransactions] = useState(() => loadJSON(TRANSACTIONS_KEY, []));
   const [saveError, setSaveError] = useState("");
   const [search, setSearch] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("All");
@@ -56,10 +67,18 @@ export default function StockDashboard() {
   const [form, setForm] = useState(emptyForm);
   const [formError, setFormError] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
   const [saleModalProduct, setSaleModalProduct] = useState(null);
   const [saleQty, setSaleQty] = useState("1");
   const [saleError, setSaleError] = useState("");
-  const [salesRange, setSalesRange] = useState("all");
+
+  const [restockModalProduct, setRestockModalProduct] = useState(null);
+  const [restockQty, setRestockQty] = useState("");
+  const [restockCost, setRestockCost] = useState("");
+  const [restockError, setRestockError] = useState("");
+
+  const [txTypeFilter, setTxTypeFilter] = useState("All");
+  const [txRange, setTxRange] = useState("all");
   const [view, setView] = useState("inventory");
 
   function persistProducts(next) {
@@ -72,10 +91,10 @@ export default function StockDashboard() {
     }
   }
 
-  function persistSales(next) {
-    setSales(next);
+  function persistTransactions(next) {
+    setTransactions(next);
     try {
-      window.localStorage.setItem(SALES_KEY, JSON.stringify(next));
+      window.localStorage.setItem(TRANSACTIONS_KEY, JSON.stringify(next));
       setSaveError("");
     } catch (e) {
       setSaveError("Changes aren't saving right now. They'll be lost on refresh.");
@@ -110,9 +129,11 @@ export default function StockDashboard() {
   const stats = useMemo(() => {
     const totalUnits = products.reduce((s, p) => s + Number(p.quantity), 0);
     const totalValue = products.reduce((s, p) => s + Number(p.quantity) * Number(p.unitPrice), 0);
+    const totalCostValue = products.reduce((s, p) => s + Number(p.quantity) * Number(p.costPrice || 0), 0);
     const low = products.filter((p) => statusOf(p) === "low").length;
     const out = products.filter((p) => statusOf(p) === "out").length;
-    return { skus: products.length, totalUnits, totalValue, low, out };
+    const potentialMargin = totalValue > 0 ? (totalValue - totalCostValue) / totalValue : NaN;
+    return { skus: products.length, totalUnits, totalValue, totalCostValue, low, out, potentialMargin };
   }, [products]);
 
   const criticalItems = useMemo(
@@ -120,20 +141,29 @@ export default function StockDashboard() {
     [products]
   );
 
-  const salesInRange = useMemo(() => {
+  const txInRange = useMemo(() => {
     let cutoff = null;
-    if (salesRange === "today") cutoff = startOfToday();
-    if (salesRange === "week") cutoff = startOfWeek();
-    if (salesRange === "month") cutoff = startOfMonth();
-    let list = sales.filter((s) => !cutoff || new Date(s.date) >= cutoff);
+    if (txRange === "today") cutoff = startOfToday();
+    if (txRange === "week") cutoff = startOfWeek();
+    if (txRange === "month") cutoff = startOfMonth();
+    let list = transactions.filter((t) => (!cutoff || new Date(t.date) >= cutoff) && (txTypeFilter === "All" || t.type === txTypeFilter));
     return list.sort((a, b) => new Date(b.date) - new Date(a.date));
-  }, [sales, salesRange]);
+  }, [transactions, txRange, txTypeFilter]);
 
   const salesStats = useMemo(() => {
-    const units = salesInRange.reduce((s, x) => s + x.quantity, 0);
-    const revenue = salesInRange.reduce((s, x) => s + x.quantity * x.unitPrice, 0);
-    return { units, revenue, count: salesInRange.length };
-  }, [salesInRange]);
+    const sales = txInRange.filter((t) => t.type === "sale");
+    const units = sales.reduce((s, x) => s + x.quantity, 0);
+    const revenue = sales.reduce((s, x) => s + x.quantity * x.unitPrice, 0);
+    const cogs = sales.reduce((s, x) => s + x.quantity * (x.unitCostAtSale || 0), 0);
+    const profit = revenue - cogs;
+    const restockSpend = txInRange.filter((t) => t.type === "restock").reduce((s, x) => s + x.quantity * x.unitCost, 0);
+    return {
+      units, revenue, cogs, profit,
+      margin: revenue > 0 ? profit / revenue : NaN,
+      restockSpend,
+      count: sales.length,
+    };
+  }, [txInRange]);
 
   function openAdd() {
     setForm(emptyForm); setEditingId(null); setFormError(""); setModalOpen(true);
@@ -143,7 +173,7 @@ export default function StockDashboard() {
     setForm({
       name: p.name, sku: p.sku, category: p.category,
       quantity: String(p.quantity), reorderPoint: String(p.reorderPoint),
-      unitPrice: String(p.unitPrice), location: p.location || "",
+      unitPrice: String(p.unitPrice), costPrice: String(p.costPrice ?? ""), location: p.location || "",
     });
     setEditingId(p.id); setFormError(""); setModalOpen(true);
   }
@@ -157,11 +187,13 @@ export default function StockDashboard() {
     const quantity = Number(form.quantity);
     const reorderPoint = Number(form.reorderPoint);
     const unitPrice = Number(form.unitPrice);
+    const costPrice = form.costPrice === "" ? 0 : Number(form.costPrice);
 
     if (!name || !sku) { setFormError("Item name and SKU are required."); return; }
     if (form.quantity === "" || quantity < 0) { setFormError("Enter a valid quantity (0 or more)."); return; }
     if (form.reorderPoint === "" || reorderPoint < 0) { setFormError("Enter a valid reorder point (0 or more)."); return; }
-    if (form.unitPrice === "" || unitPrice < 0) { setFormError("Enter a valid unit price (0 or more)."); return; }
+    if (form.unitPrice === "" || unitPrice < 0) { setFormError("Enter a valid sell price (0 or more)."); return; }
+    if (costPrice < 0) { setFormError("Enter a valid cost price (0 or more)."); return; }
 
     const dupe = products.find((p) => p.sku.toLowerCase() === sku.toLowerCase() && p.id !== editingId);
     if (dupe) { setFormError(`SKU "${sku}" is already used by ${dupe.name}.`); return; }
@@ -169,25 +201,34 @@ export default function StockDashboard() {
     if (editingId) {
       const next = products.map((p) =>
         p.id === editingId
-          ? { ...p, name, sku, category: form.category.trim() || "Uncategorized", quantity, reorderPoint, unitPrice, location: form.location.trim() }
+          ? { ...p, name, sku, category: form.category.trim() || "Uncategorized", quantity, reorderPoint, unitPrice, costPrice, location: form.location.trim() }
           : p
       );
       persistProducts(next);
     } else {
       const next = [...products, {
         id: crypto.randomUUID(), name, sku, category: form.category.trim() || "Uncategorized",
-        quantity, reorderPoint, unitPrice, location: form.location.trim(),
+        quantity, reorderPoint, unitPrice, costPrice, location: form.location.trim(),
       }];
       persistProducts(next);
     }
     setModalOpen(false);
   }
 
+  // Quick +/- stays for minor corrections (damaged, miscount) — logged as an adjustment, no cost impact.
   function adjustQty(id, delta) {
-    const next = products.map((p) =>
-      p.id === id ? { ...p, quantity: Math.max(0, Number(p.quantity) + delta) } : p
-    );
+    const product = products.find((p) => p.id === id);
+    if (!product) return;
+    const newQty = Math.max(0, Number(product.quantity) + delta);
+    const actualDelta = newQty - product.quantity;
+    if (actualDelta === 0) return;
+    const next = products.map((p) => (p.id === id ? { ...p, quantity: newQty } : p));
     persistProducts(next);
+    persistTransactions([...transactions, {
+      id: crypto.randomUUID(), productId: id, productName: product.name, sku: product.sku,
+      type: "adjustment", quantity: actualDelta, date: new Date().toISOString(),
+      note: "Manual quantity adjustment",
+    }]);
   }
 
   function deleteProduct(id) {
@@ -195,6 +236,37 @@ export default function StockDashboard() {
     setConfirmDeleteId(null);
   }
 
+  // ---- Stock IN (restock) ----
+  function openRestockModal(p) {
+    setRestockModalProduct(p); setRestockQty(""); setRestockCost(String(p.costPrice ?? "")); setRestockError("");
+  }
+
+  function submitRestock(e) {
+    e.preventDefault();
+    const qty = Number(restockQty);
+    const unitCost = restockCost === "" ? 0 : Number(restockCost);
+    if (!restockQty || qty <= 0) { setRestockError("Enter a quantity greater than 0."); return; }
+    if (unitCost < 0) { setRestockError("Enter a valid cost (0 or more)."); return; }
+
+    const p = restockModalProduct;
+    const oldQty = Number(p.quantity);
+    const oldCost = Number(p.costPrice || 0);
+    // Weighted average cost across old stock + incoming stock.
+    const newQty = oldQty + qty;
+    const newCostPrice = newQty > 0 ? ((oldQty * oldCost) + (qty * unitCost)) / newQty : unitCost;
+
+    const nextProducts = products.map((prod) =>
+      prod.id === p.id ? { ...prod, quantity: newQty, costPrice: newCostPrice } : prod
+    );
+    persistProducts(nextProducts);
+    persistTransactions([...transactions, {
+      id: crypto.randomUUID(), productId: p.id, productName: p.name, sku: p.sku,
+      type: "restock", quantity: qty, unitCost, date: new Date().toISOString(),
+    }]);
+    setRestockModalProduct(null);
+  }
+
+  // ---- Stock OUT (sale) ----
   function openSaleModal(p) {
     setSaleModalProduct(p); setSaleQty("1"); setSaleError("");
   }
@@ -215,20 +287,27 @@ export default function StockDashboard() {
       productId: saleModalProduct.id,
       productName: saleModalProduct.name,
       sku: saleModalProduct.sku,
+      type: "sale",
       quantity: qty,
       unitPrice: saleModalProduct.unitPrice,
+      unitCostAtSale: Number(saleModalProduct.costPrice || 0), // lock in cost at time of sale for accurate margin history
       date: new Date().toISOString(),
     };
-    persistSales([...sales, saleRecord]);
+    persistTransactions([...transactions, saleRecord]);
     setSaleModalProduct(null);
   }
 
-  function undoSale(sale) {
-    const nextProducts = products.map((p) =>
-      p.id === sale.productId ? { ...p, quantity: p.quantity + sale.quantity } : p
-    );
+  function undoTransaction(tx) {
+    const product = products.find((p) => p.id === tx.productId);
+    if (!product) { persistTransactions(transactions.filter((t) => t.id !== tx.id)); return; }
+    let nextQty = product.quantity;
+    if (tx.type === "sale") nextQty += tx.quantity;
+    if (tx.type === "restock") nextQty -= tx.quantity;
+    if (tx.type === "adjustment") nextQty -= tx.quantity;
+    nextQty = Math.max(0, nextQty);
+    const nextProducts = products.map((p) => (p.id === tx.productId ? { ...p, quantity: nextQty } : p));
     persistProducts(nextProducts);
-    persistSales(sales.filter((s) => s.id !== sale.id));
+    persistTransactions(transactions.filter((t) => t.id !== tx.id));
   }
 
   function toggleSort(key) {
@@ -315,7 +394,9 @@ export default function StockDashboard() {
         .sd-icon-btn { background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: 4px; border-radius: 4px; }
         .sd-icon-btn:hover { color: var(--text); background: var(--surface-2); }
         .sd-icon-btn.danger:hover { color: var(--red); }
-        .sd-icon-btn.sale:hover { color: var(--teal); }
+        .sd-icon-btn.sale:hover { color: var(--amber); }
+        .sd-icon-btn.restock:hover { color: var(--teal); }
+        .sd-icon-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
         .sd-empty { text-align: center; padding: 60px 20px; color: var(--text-muted); }
         .sd-empty h3 { color: var(--text); font-family: 'Oswald', sans-serif; text-transform: uppercase; margin: 12px 0 6px; }
@@ -343,6 +424,8 @@ export default function StockDashboard() {
         .sd-range-tabs { display: flex; gap: 4px; }
         .sd-range-btn { background: var(--surface); border: 1px solid var(--border); color: var(--text-muted); padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
         .sd-range-btn.active { background: var(--surface-2); color: var(--amber); border-color: var(--amber); }
+
+        .sd-cost-hint { font-size: 11px; color: var(--text-muted); margin-top: -6px; margin-bottom: 12px; }
       `}</style>
 
       <div className="sd-header">
@@ -362,8 +445,8 @@ export default function StockDashboard() {
         <button className={`sd-tab ${view === "inventory" ? "active" : ""}`} onClick={() => setView("inventory")}>
           <Package size={14} /> Inventory
         </button>
-        <button className={`sd-tab ${view === "sales" ? "active" : ""}`} onClick={() => setView("sales")}>
-          <TrendingUp size={14} /> Sales
+        <button className={`sd-tab ${view === "activity" ? "active" : ""}`} onClick={() => setView("activity")}>
+          <TrendingUp size={14} /> Activity &amp; Margin
         </button>
       </div>
 
@@ -391,7 +474,9 @@ export default function StockDashboard() {
           <div className="sd-stats">
             <div className="sd-stat"><div className="val sd-mono">{stats.skus}</div><div className="lbl">SKUs</div></div>
             <div className="sd-stat"><div className="val sd-mono">{stats.totalUnits}</div><div className="lbl">Total units</div></div>
-            <div className="sd-stat"><div className="val sd-mono">{currency(stats.totalValue)}</div><div className="lbl">Inventory value</div></div>
+            <div className="sd-stat"><div className="val sd-mono">{currency(stats.totalValue)}</div><div className="lbl">Inventory value (retail)</div></div>
+            <div className="sd-stat"><div className="val sd-mono">{currency(stats.totalCostValue)}</div><div className="lbl">Inventory value (cost)</div></div>
+            <div className="sd-stat"><div className="val sd-mono" style={{ color: "var(--teal)" }}>{pct(stats.potentialMargin)}</div><div className="lbl">Potential margin</div></div>
             <div className="sd-stat"><div className="val sd-mono" style={{ color: "var(--amber)" }}>{stats.low}</div><div className="lbl">Needs reorder</div></div>
             <div className="sd-stat"><div className="val sd-mono" style={{ color: "var(--red)" }}>{stats.out}</div><div className="lbl">Out of stock</div></div>
           </div>
@@ -435,8 +520,9 @@ export default function StockDashboard() {
                     <SortTh label="Category" k="category" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
                     <SortTh label="Stock" k="quantity" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
                     <th>Status</th>
-                    <SortTh label="Unit price" k="unitPrice" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
-                    <th>Value</th>
+                    <SortTh label="Cost" k="costPrice" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                    <SortTh label="Sell" k="unitPrice" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                    <th>Margin</th>
                     <th></th>
                   </tr>
                 </thead>
@@ -445,7 +531,9 @@ export default function StockDashboard() {
                     const status = statusOf(p);
                     const meta = STATUS_META[status];
                     const max = Math.max(p.reorderPoint * 2, p.quantity, 1);
-                    const pct = Math.min(100, (p.quantity / max) * 100);
+                    const gaugePct = Math.min(100, (p.quantity / max) * 100);
+                    const cost = Number(p.costPrice || 0);
+                    const marginPct = p.unitPrice > 0 ? (p.unitPrice - cost) / p.unitPrice : NaN;
                     return (
                       <tr key={p.id}>
                         <td>
@@ -461,7 +549,7 @@ export default function StockDashboard() {
                             <button className="sd-qty-btn" onClick={() => adjustQty(p.id, 1)} aria-label={`Increase ${p.name} quantity`}><ChevronUp size={13} /></button>
                           </div>
                           <div className="sd-gauge-wrap" style={{ marginTop: 6 }}>
-                            <div className="sd-gauge"><div className="sd-gauge-fill" style={{ width: `${pct}%`, background: meta.color }} /></div>
+                            <div className="sd-gauge"><div className="sd-gauge-fill" style={{ width: `${gaugePct}%`, background: meta.color }} /></div>
                           </div>
                         </td>
                         <td>
@@ -472,11 +560,15 @@ export default function StockDashboard() {
                             {meta.label}
                           </span>
                         </td>
+                        <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{currency(cost)}</td>
                         <td className="sd-mono">{currency(p.unitPrice)}</td>
-                        <td className="sd-mono">{currency(p.quantity * p.unitPrice)}</td>
+                        <td className="sd-mono" style={{ color: !isFinite(marginPct) ? "var(--text-muted)" : marginPct < 0 ? "var(--red)" : "var(--teal)" }}>
+                          {pct(marginPct)}
+                        </td>
                         <td>
                           <div style={{ display: "flex", gap: 2, position: "relative" }}>
-                            <button className="sd-icon-btn sale" onClick={() => openSaleModal(p)} aria-label={`Record sale of ${p.name}`} disabled={p.quantity <= 0} title="Record sale"><ShoppingCart size={14} /></button>
+                            <button className="sd-icon-btn restock" onClick={() => openRestockModal(p)} aria-label={`Restock ${p.name}`} title="Stock in (restock)"><ArrowDownToLine size={14} /></button>
+                            <button className="sd-icon-btn sale" onClick={() => openSaleModal(p)} aria-label={`Record sale of ${p.name}`} disabled={p.quantity <= 0} title="Stock out (sale)"><ArrowUpFromLine size={14} /></button>
                             <button className="sd-icon-btn" onClick={() => openEdit(p)} aria-label={`Edit ${p.name}`}><Pencil size={14} /></button>
                             <button className="sd-icon-btn danger" onClick={() => setConfirmDeleteId(p.id)} aria-label={`Delete ${p.name}`}><Trash2 size={14} /></button>
                             {confirmDeleteId === p.id && (
@@ -500,50 +592,72 @@ export default function StockDashboard() {
         </>
       )}
 
-      {view === "sales" && (
+      {view === "activity" && (
         <>
           <div className="sd-toolbar" style={{ justifyContent: "space-between" }}>
             <div className="sd-range-tabs">
               {[["all", "All time"], ["today", "Today"], ["week", "This week"], ["month", "This month"]].map(([k, label]) => (
-                <button key={k} className={`sd-range-btn ${salesRange === k ? "active" : ""}`} onClick={() => setSalesRange(k)}>{label}</button>
+                <button key={k} className={`sd-range-btn ${txRange === k ? "active" : ""}`} onClick={() => setTxRange(k)}>{label}</button>
               ))}
             </div>
+            <select className="sd-select" value={txTypeFilter} onChange={(e) => setTxTypeFilter(e.target.value)}>
+              <option value="All">All types</option>
+              <option value="sale">Stock out (sales)</option>
+              <option value="restock">Stock in (restocks)</option>
+              <option value="adjustment">Adjustments</option>
+            </select>
           </div>
 
           <div className="sd-stats">
             <div className="sd-stat"><div className="val sd-mono">{salesStats.count}</div><div className="lbl">Sales logged</div></div>
             <div className="sd-stat"><div className="val sd-mono">{salesStats.units}</div><div className="lbl">Units sold</div></div>
             <div className="sd-stat"><div className="val sd-mono" style={{ color: "var(--teal)" }}>{currency(salesStats.revenue)}</div><div className="lbl">Revenue</div></div>
+            <div className="sd-stat"><div className="val sd-mono">{currency(salesStats.cogs)}</div><div className="lbl">Cost of goods sold</div></div>
+            <div className="sd-stat"><div className="val sd-mono" style={{ color: salesStats.profit < 0 ? "var(--red)" : "var(--teal)" }}>{currency(salesStats.profit)}</div><div className="lbl">Gross profit</div></div>
+            <div className="sd-stat"><div className="val sd-mono" style={{ color: !isFinite(salesStats.margin) ? "var(--text-muted)" : salesStats.margin < 0 ? "var(--red)" : "var(--teal)" }}>{pct(salesStats.margin)}</div><div className="lbl">Margin</div></div>
+            <div className="sd-stat"><div className="val sd-mono" style={{ color: "var(--amber)" }}>{currency(salesStats.restockSpend)}</div><div className="lbl">Restock spend</div></div>
           </div>
 
-          {salesInRange.length === 0 ? (
+          {txInRange.length === 0 ? (
             <div className="sd-empty">
               <ShoppingCart size={36} color="#8891a0" />
-              <h3>No sales in this range</h3>
-              <p>Use the cart icon next to an item in Inventory to log a sale.</p>
+              <h3>No activity in this range</h3>
+              <p>Use the arrow icons next to an item in Inventory to log stock in or stock out.</p>
             </div>
           ) : (
             <div className="sd-table-wrap">
               <table className="sd-table">
                 <thead>
                   <tr>
-                    <th>Date</th><th>Item</th><th>SKU</th><th>Qty</th><th>Unit price</th><th>Total</th><th></th>
+                    <th>Date</th><th>Type</th><th>Item</th><th>SKU</th><th>Qty</th><th>Unit</th><th>Total</th><th>Profit</th><th></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {salesInRange.map((s) => (
-                    <tr key={s.id}>
-                      <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{new Date(s.date).toLocaleString()}</td>
-                      <td style={{ fontWeight: 600 }}>{s.productName}</td>
-                      <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{s.sku}</td>
-                      <td className="sd-mono">{s.quantity}</td>
-                      <td className="sd-mono">{currency(s.unitPrice)}</td>
-                      <td className="sd-mono" style={{ color: "var(--teal)" }}>{currency(s.quantity * s.unitPrice)}</td>
-                      <td>
-                        <button className="sd-icon-btn danger" onClick={() => undoSale(s)} title="Undo this sale (restores stock)"><X size={14} /></button>
-                      </td>
-                    </tr>
-                  ))}
+                  {txInRange.map((t) => {
+                    const meta = TX_META[t.type];
+                    const isSale = t.type === "sale";
+                    const isRestock = t.type === "restock";
+                    const unit = isSale ? t.unitPrice : isRestock ? t.unitCost : null;
+                    const total = isSale ? t.quantity * t.unitPrice : isRestock ? t.quantity * t.unitCost : null;
+                    const profit = isSale ? (t.unitPrice - (t.unitCostAtSale || 0)) * t.quantity : null;
+                    return (
+                      <tr key={t.id}>
+                        <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{new Date(t.date).toLocaleString()}</td>
+                        <td><span className="sd-badge" style={{ color: meta.color, background: meta.bg }}>{meta.label}</span></td>
+                        <td style={{ fontWeight: 600 }}>{t.productName}</td>
+                        <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{t.sku}</td>
+                        <td className="sd-mono">{meta.sign}{t.quantity}</td>
+                        <td className="sd-mono">{unit != null ? currency(unit) : "—"}</td>
+                        <td className="sd-mono">{total != null ? currency(total) : "—"}</td>
+                        <td className="sd-mono" style={{ color: profit == null ? "var(--text-muted)" : profit < 0 ? "var(--red)" : "var(--teal)" }}>
+                          {profit != null ? currency(profit) : "—"}
+                        </td>
+                        <td>
+                          <button className="sd-icon-btn danger" onClick={() => undoTransaction(t)} title="Undo (reverses stock change)"><X size={14} /></button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -583,13 +697,18 @@ export default function StockDashboard() {
               </div>
               <div className="sd-field-row">
                 <div className="sd-field">
-                  <label htmlFor="sd-price">Unit price</label>
-                  <input id="sd-price" type="number" min="0" step="0.01" value={form.unitPrice} onChange={(e) => setForm({ ...form, unitPrice: e.target.value })} placeholder="0.00" />
+                  <label htmlFor="sd-cost">Cost price</label>
+                  <input id="sd-cost" type="number" min="0" step="0.01" value={form.costPrice} onChange={(e) => setForm({ ...form, costPrice: e.target.value })} placeholder="0.00" />
                 </div>
                 <div className="sd-field">
-                  <label htmlFor="sd-loc">Location (optional)</label>
-                  <input id="sd-loc" value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} placeholder="Aisle 3, Bin 4" />
+                  <label htmlFor="sd-price">Sell price</label>
+                  <input id="sd-price" type="number" min="0" step="0.01" value={form.unitPrice} onChange={(e) => setForm({ ...form, unitPrice: e.target.value })} placeholder="0.00" />
                 </div>
+              </div>
+              <div className="sd-cost-hint">Once stock is moving, cost price is auto-updated (weighted average) whenever you restock — you won't usually need to edit it here after that.</div>
+              <div className="sd-field">
+                <label htmlFor="sd-loc">Location (optional)</label>
+                <input id="sd-loc" value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} placeholder="Aisle 3, Bin 4" />
               </div>
               <div className="sd-modal-actions">
                 <button type="button" className="sd-btn-secondary" onClick={closeModal}>Cancel</button>
@@ -600,10 +719,50 @@ export default function StockDashboard() {
         </div>
       )}
 
+      {restockModalProduct && (
+        <div className="sd-modal-overlay" onClick={() => setRestockModalProduct(null)}>
+          <div className="sd-modal" onClick={(e) => e.stopPropagation()}>
+            <h2>Stock in — restock</h2>
+            {restockError && <div className="sd-form-error">{restockError}</div>}
+            <div className="sd-sale-summary">
+              <div className="row"><span>{restockModalProduct.name}</span><span className="sd-mono">{restockModalProduct.quantity} in stock</span></div>
+              <div className="row" style={{ color: "var(--text-muted)", fontWeight: 400 }}><span>Current avg. cost</span><span className="sd-mono">{currency(restockModalProduct.costPrice || 0)}</span></div>
+            </div>
+            <form onSubmit={submitRestock}>
+              <div className="sd-field-row">
+                <div className="sd-field">
+                  <label htmlFor="sd-restock-qty">Quantity received</label>
+                  <input id="sd-restock-qty" type="number" min="1" value={restockQty} onChange={(e) => setRestockQty(e.target.value)} autoFocus />
+                </div>
+                <div className="sd-field">
+                  <label htmlFor="sd-restock-cost">Cost per unit</label>
+                  <input id="sd-restock-cost" type="number" min="0" step="0.01" value={restockCost} onChange={(e) => setRestockCost(e.target.value)} placeholder="0.00" />
+                </div>
+              </div>
+              <div className="sd-cost-hint">
+                {restockQty && restockCost !== "" ? (() => {
+                  const oldQty = Number(restockModalProduct.quantity);
+                  const oldCost = Number(restockModalProduct.costPrice || 0);
+                  const qty = Number(restockQty) || 0;
+                  const unitCost = Number(restockCost) || 0;
+                  const newQty = oldQty + qty;
+                  const newCost = newQty > 0 ? ((oldQty * oldCost) + (qty * unitCost)) / newQty : unitCost;
+                  return `New weighted average cost will be ${currency(newCost)} across ${newQty} units.`;
+                })() : "Enter quantity and cost to preview the new average cost."}
+              </div>
+              <div className="sd-modal-actions">
+                <button type="button" className="sd-btn-secondary" onClick={() => setRestockModalProduct(null)}>Cancel</button>
+                <button type="submit" className="sd-btn-primary">Add stock</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {saleModalProduct && (
         <div className="sd-modal-overlay" onClick={() => setSaleModalProduct(null)}>
           <div className="sd-modal" onClick={(e) => e.stopPropagation()}>
-            <h2>Record sale</h2>
+            <h2>Stock out — sale</h2>
             {saleError && <div className="sd-form-error">{saleError}</div>}
             <div className="sd-sale-summary">
               <div className="row"><span>{saleModalProduct.name}</span><span className="sd-mono">{saleModalProduct.quantity} in stock</span></div>
@@ -614,8 +773,9 @@ export default function StockDashboard() {
                 <input id="sd-sale-qty" type="number" min="1" max={saleModalProduct.quantity} value={saleQty} onChange={(e) => setSaleQty(e.target.value)} autoFocus />
               </div>
               <div className="sd-sale-summary">
-                <div className="row"><span>Unit price</span><span className="sd-mono">{currency(saleModalProduct.unitPrice)}</span></div>
-                <div className="row"><span>Total</span><span className="sd-mono">{currency((Number(saleQty) || 0) * saleModalProduct.unitPrice)}</span></div>
+                <div className="row"><span>Sell price</span><span className="sd-mono">{currency(saleModalProduct.unitPrice)}</span></div>
+                <div className="row" style={{ color: "var(--text-muted)", fontWeight: 400 }}><span>Cost price</span><span className="sd-mono">{currency(saleModalProduct.costPrice || 0)}</span></div>
+                <div className="row"><span>Profit</span><span className="sd-mono">{currency(((Number(saleQty) || 0)) * (saleModalProduct.unitPrice - Number(saleModalProduct.costPrice || 0)))}</span></div>
               </div>
               <div className="sd-modal-actions">
                 <button type="button" className="sd-btn-secondary" onClick={() => setSaleModalProduct(null)}>Cancel</button>
