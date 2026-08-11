@@ -1,19 +1,16 @@
 import { useState, useEffect, useMemo } from "react";
 import {
   Package, Plus, Search, AlertTriangle, Pencil, Trash2, X,
-  ChevronUp, ChevronDown, Boxes, CircleAlert, CircleCheck, RotateCcw
+  ChevronUp, ChevronDown, Boxes, CircleAlert, CircleCheck,
+  DollarSign, TrendingUp, ShoppingCart
 } from "lucide-react";
 
-const STORAGE_KEY = "products";
+const PRODUCTS_KEY = "products";
+const SALES_KEY = "sales";
 
 const emptyForm = {
-  name: "",
-  sku: "",
-  category: "",
-  quantity: "",
-  reorderPoint: "",
-  unitPrice: "",
-  location: "",
+  name: "", sku: "", category: "", quantity: "",
+  reorderPoint: "", unitPrice: "", location: "",
 };
 
 function statusOf(p) {
@@ -32,18 +29,22 @@ function currency(n) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n || 0);
 }
 
-function loadFromLocalStorage() {
+function loadJSON(key, fallback) {
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
+    const raw = window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
   } catch (e) {
-    return [];
+    return fallback;
   }
 }
 
+function startOfToday() { const d = new Date(); d.setHours(0, 0, 0, 0); return d; }
+function startOfWeek() { const d = startOfToday(); d.setDate(d.getDate() - d.getDay()); return d; }
+function startOfMonth() { const d = startOfToday(); d.setDate(1); return d; }
+
 export default function StockDashboard() {
-  const [products, setProducts] = useState(loadFromLocalStorage);
-  const [loaded, setLoaded] = useState(true);
+  const [products, setProducts] = useState(() => loadJSON(PRODUCTS_KEY, []));
+  const [sales, setSales] = useState(() => loadJSON(SALES_KEY, []));
   const [saveError, setSaveError] = useState("");
   const [search, setSearch] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("All");
@@ -55,14 +56,29 @@ export default function StockDashboard() {
   const [form, setForm] = useState(emptyForm);
   const [formError, setFormError] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [saleModalProduct, setSaleModalProduct] = useState(null);
+  const [saleQty, setSaleQty] = useState("1");
+  const [saleError, setSaleError] = useState("");
+  const [salesRange, setSalesRange] = useState("all");
+  const [view, setView] = useState("inventory");
 
-  function persist(next) {
+  function persistProducts(next) {
     setProducts(next);
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      window.localStorage.setItem(PRODUCTS_KEY, JSON.stringify(next));
       setSaveError("");
     } catch (e) {
-      setSaveError("Changes aren't saving right now (browser storage may be full or disabled). They'll be lost on refresh.");
+      setSaveError("Changes aren't saving right now. They'll be lost on refresh.");
+    }
+  }
+
+  function persistSales(next) {
+    setSales(next);
+    try {
+      window.localStorage.setItem(SALES_KEY, JSON.stringify(next));
+      setSaveError("");
+    } catch (e) {
+      setSaveError("Changes aren't saving right now. They'll be lost on refresh.");
     }
   }
 
@@ -104,11 +120,23 @@ export default function StockDashboard() {
     [products]
   );
 
+  const salesInRange = useMemo(() => {
+    let cutoff = null;
+    if (salesRange === "today") cutoff = startOfToday();
+    if (salesRange === "week") cutoff = startOfWeek();
+    if (salesRange === "month") cutoff = startOfMonth();
+    let list = sales.filter((s) => !cutoff || new Date(s.date) >= cutoff);
+    return list.sort((a, b) => new Date(b.date) - new Date(a.date));
+  }, [sales, salesRange]);
+
+  const salesStats = useMemo(() => {
+    const units = salesInRange.reduce((s, x) => s + x.quantity, 0);
+    const revenue = salesInRange.reduce((s, x) => s + x.quantity * x.unitPrice, 0);
+    return { units, revenue, count: salesInRange.length };
+  }, [salesInRange]);
+
   function openAdd() {
-    setForm(emptyForm);
-    setEditingId(null);
-    setFormError("");
-    setModalOpen(true);
+    setForm(emptyForm); setEditingId(null); setFormError(""); setModalOpen(true);
   }
 
   function openEdit(p) {
@@ -117,15 +145,10 @@ export default function StockDashboard() {
       quantity: String(p.quantity), reorderPoint: String(p.reorderPoint),
       unitPrice: String(p.unitPrice), location: p.location || "",
     });
-    setEditingId(p.id);
-    setFormError("");
-    setModalOpen(true);
+    setEditingId(p.id); setFormError(""); setModalOpen(true);
   }
 
-  function closeModal() {
-    setModalOpen(false);
-    setFormError("");
-  }
+  function closeModal() { setModalOpen(false); setFormError(""); }
 
   function submitForm(e) {
     e.preventDefault();
@@ -140,9 +163,7 @@ export default function StockDashboard() {
     if (form.reorderPoint === "" || reorderPoint < 0) { setFormError("Enter a valid reorder point (0 or more)."); return; }
     if (form.unitPrice === "" || unitPrice < 0) { setFormError("Enter a valid unit price (0 or more)."); return; }
 
-    const dupe = products.find(
-      (p) => p.sku.toLowerCase() === sku.toLowerCase() && p.id !== editingId
-    );
+    const dupe = products.find((p) => p.sku.toLowerCase() === sku.toLowerCase() && p.id !== editingId);
     if (dupe) { setFormError(`SKU "${sku}" is already used by ${dupe.name}.`); return; }
 
     if (editingId) {
@@ -151,17 +172,13 @@ export default function StockDashboard() {
           ? { ...p, name, sku, category: form.category.trim() || "Uncategorized", quantity, reorderPoint, unitPrice, location: form.location.trim() }
           : p
       );
-      persist(next);
+      persistProducts(next);
     } else {
-      const next = [
-        ...products,
-        {
-          id: crypto.randomUUID(),
-          name, sku, category: form.category.trim() || "Uncategorized",
-          quantity, reorderPoint, unitPrice, location: form.location.trim(),
-        },
-      ];
-      persist(next);
+      const next = [...products, {
+        id: crypto.randomUUID(), name, sku, category: form.category.trim() || "Uncategorized",
+        quantity, reorderPoint, unitPrice, location: form.location.trim(),
+      }];
+      persistProducts(next);
     }
     setModalOpen(false);
   }
@@ -170,13 +187,48 @@ export default function StockDashboard() {
     const next = products.map((p) =>
       p.id === id ? { ...p, quantity: Math.max(0, Number(p.quantity) + delta) } : p
     );
-    persist(next);
+    persistProducts(next);
   }
 
   function deleteProduct(id) {
-    const next = products.filter((p) => p.id !== id);
-    persist(next);
+    persistProducts(products.filter((p) => p.id !== id));
     setConfirmDeleteId(null);
+  }
+
+  function openSaleModal(p) {
+    setSaleModalProduct(p); setSaleQty("1"); setSaleError("");
+  }
+
+  function submitSale(e) {
+    e.preventDefault();
+    const qty = Number(saleQty);
+    if (!saleQty || qty <= 0) { setSaleError("Enter a quantity greater than 0."); return; }
+    if (qty > saleModalProduct.quantity) { setSaleError(`Only ${saleModalProduct.quantity} in stock.`); return; }
+
+    const nextProducts = products.map((p) =>
+      p.id === saleModalProduct.id ? { ...p, quantity: p.quantity - qty } : p
+    );
+    persistProducts(nextProducts);
+
+    const saleRecord = {
+      id: crypto.randomUUID(),
+      productId: saleModalProduct.id,
+      productName: saleModalProduct.name,
+      sku: saleModalProduct.sku,
+      quantity: qty,
+      unitPrice: saleModalProduct.unitPrice,
+      date: new Date().toISOString(),
+    };
+    persistSales([...sales, saleRecord]);
+    setSaleModalProduct(null);
+  }
+
+  function undoSale(sale) {
+    const nextProducts = products.map((p) =>
+      p.id === sale.productId ? { ...p, quantity: p.quantity + sale.quantity } : p
+    );
+    persistProducts(nextProducts);
+    persistSales(sales.filter((s) => s.id !== sale.id));
   }
 
   function toggleSort(key) {
@@ -190,110 +242,60 @@ export default function StockDashboard() {
         @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
         .stock-dash {
-          --bg: #12151b;
-          --surface: #1a1f28;
-          --surface-2: #212836;
-          --border: #2c3444;
-          --text: #e8eaed;
-          --text-muted: #8891a0;
-          --amber: #f2a93b;
-          --red: #e5484d;
-          --teal: #3ecf8e;
-          font-family: 'Inter', sans-serif;
-          background: var(--bg);
-          color: var(--text);
-          min-height: 100%;
-          padding: 24px;
-          border-radius: 8px;
-          box-sizing: border-box;
+          --bg: #12151b; --surface: #1a1f28; --surface-2: #212836; --border: #2c3444;
+          --text: #e8eaed; --text-muted: #8891a0; --amber: #f2a93b; --red: #e5484d; --teal: #3ecf8e;
+          font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text);
+          min-height: 100%; padding: 24px; border-radius: 8px; box-sizing: border-box;
         }
         .stock-dash * { box-sizing: border-box; }
         .sd-mono { font-family: 'IBM Plex Mono', monospace; }
         .sd-display { font-family: 'Oswald', sans-serif; text-transform: uppercase; letter-spacing: 0.04em; }
 
-        .sd-header {
-          display: flex; align-items: center; justify-content: space-between;
-          gap: 16px; margin-bottom: 20px; flex-wrap: wrap;
-        }
+        .sd-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
         .sd-title { display: flex; align-items: center; gap: 10px; }
         .sd-title h1 { font-size: 22px; font-weight: 700; margin: 0; }
         .sd-title .sub { color: var(--text-muted); font-size: 12px; margin-top: 2px; letter-spacing: 0.06em; }
 
         .sd-add-btn {
-          display: flex; align-items: center; gap: 6px;
-          background: var(--amber); color: #14161c; border: none;
-          font-family: 'Oswald', sans-serif; font-weight: 600; letter-spacing: 0.05em;
-          text-transform: uppercase; font-size: 13px;
-          padding: 10px 16px; border-radius: 6px; cursor: pointer;
-          transition: filter 0.15s ease;
+          display: flex; align-items: center; gap: 6px; background: var(--amber); color: #14161c; border: none;
+          font-family: 'Oswald', sans-serif; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+          font-size: 13px; padding: 10px 16px; border-radius: 6px; cursor: pointer; transition: filter 0.15s ease;
         }
         .sd-add-btn:hover { filter: brightness(1.08); }
         .sd-add-btn:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 
-        /* LED ticker */
-        .sd-ticker {
-          background: #000; border: 1px solid #2a2000; border-radius: 6px;
-          padding: 10px 14px; margin-bottom: 20px;
-          display: flex; align-items: center; gap: 12px; overflow: hidden;
+        .sd-tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--border); }
+        .sd-tab {
+          background: transparent; border: none; color: var(--text-muted); padding: 10px 16px;
+          font-family: 'Oswald', sans-serif; text-transform: uppercase; font-size: 13px; letter-spacing: 0.04em;
+          cursor: pointer; border-bottom: 2px solid transparent; display: flex; align-items: center; gap: 6px;
         }
-        .sd-ticker-dot {
-          width: 8px; height: 8px; border-radius: 50%; background: var(--red);
-          flex-shrink: 0; animation: sd-blink 1.4s ease-in-out infinite;
-        }
+        .sd-tab.active { color: var(--amber); border-bottom-color: var(--amber); }
+        .sd-tab:hover:not(.active) { color: var(--text); }
+
+        .sd-ticker { background: #000; border: 1px solid #2a2000; border-radius: 6px; padding: 10px 14px; margin-bottom: 20px; display: flex; align-items: center; gap: 12px; overflow: hidden; }
+        .sd-ticker-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); flex-shrink: 0; animation: sd-blink 1.4s ease-in-out infinite; }
         .sd-ticker-track { overflow: hidden; flex: 1; white-space: nowrap; }
-        .sd-ticker-inner {
-          display: inline-block; font-family: 'IBM Plex Mono', monospace;
-          font-size: 13px; color: var(--amber); letter-spacing: 0.03em;
-          animation: sd-scroll 22s linear infinite;
-        }
+        .sd-ticker-inner { display: inline-block; font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--amber); letter-spacing: 0.03em; animation: sd-scroll 22s linear infinite; }
         .sd-ticker-ok { font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--teal); }
         @keyframes sd-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
         @keyframes sd-scroll { 0% { transform: translateX(0); } 100% { transform: translateX(-50%); } }
-        @media (prefers-reduced-motion: reduce) {
-          .sd-ticker-inner { animation: none; }
-          .sd-ticker-dot { animation: none; }
-        }
+        @media (prefers-reduced-motion: reduce) { .sd-ticker-inner { animation: none; } .sd-ticker-dot { animation: none; } }
 
-        .sd-stats {
-          display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-          gap: 10px; margin-bottom: 20px;
-        }
-        .sd-stat {
-          background: var(--surface); border: 1px solid var(--border);
-          border-radius: 8px; padding: 12px 14px;
-        }
+        .sd-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 20px; }
+        .sd-stat { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
         .sd-stat .val { font-family: 'Oswald', sans-serif; font-size: 24px; font-weight: 600; }
         .sd-stat .lbl { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; margin-top: 2px; }
 
-        .sd-toolbar {
-          display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; align-items: center;
-        }
-        .sd-search {
-          display: flex; align-items: center; gap: 8px;
-          background: var(--surface); border: 1px solid var(--border);
-          border-radius: 6px; padding: 8px 12px; flex: 1; min-width: 180px;
-        }
-        .sd-search input {
-          background: transparent; border: none; outline: none; color: var(--text);
-          font-size: 14px; width: 100%;
-        }
+        .sd-toolbar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+        .sd-search { display: flex; align-items: center; gap: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; flex: 1; min-width: 180px; }
+        .sd-search input { background: transparent; border: none; outline: none; color: var(--text); font-size: 14px; width: 100%; }
         .sd-search input::placeholder { color: var(--text-muted); }
-        .sd-select {
-          background: var(--surface); border: 1px solid var(--border); color: var(--text);
-          border-radius: 6px; padding: 8px 10px; font-size: 13px; cursor: pointer;
-        }
+        .sd-select { background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 10px; font-size: 13px; cursor: pointer; }
 
-        .sd-table-wrap {
-          background: var(--surface); border: 1px solid var(--border);
-          border-radius: 8px; overflow: hidden;
-        }
+        .sd-table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; overflow-x: auto; }
         table.sd-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        .sd-table th {
-          text-align: left; padding: 10px 12px; color: var(--text-muted);
-          font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
-          border-bottom: 1px solid var(--border); cursor: pointer; user-select: none;
-          white-space: nowrap;
-        }
+        .sd-table th { text-align: left; padding: 10px 12px; color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; white-space: nowrap; }
         .sd-table th:hover { color: var(--text); }
         .sd-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
         .sd-table tr:last-child td { border-bottom: none; }
@@ -303,74 +305,44 @@ export default function StockDashboard() {
         .sd-gauge { flex: 1; height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
         .sd-gauge-fill { height: 100%; border-radius: 3px; }
 
-        .sd-badge {
-          display: inline-flex; align-items: center; gap: 4px;
-          padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;
-          text-transform: uppercase; letter-spacing: 0.04em;
-        }
+        .sd-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
 
         .sd-qty-controls { display: flex; align-items: center; gap: 6px; }
-        .sd-qty-btn {
-          width: 22px; height: 22px; border-radius: 4px; border: 1px solid var(--border);
-          background: var(--surface-2); color: var(--text); cursor: pointer;
-          display: flex; align-items: center; justify-content: center;
-        }
+        .sd-qty-btn { width: 22px; height: 22px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; display: flex; align-items: center; justify-content: center; }
         .sd-qty-btn:hover { border-color: var(--amber); }
         .sd-qty-btn:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
 
-        .sd-icon-btn {
-          background: transparent; border: none; color: var(--text-muted);
-          cursor: pointer; padding: 4px; border-radius: 4px;
-        }
+        .sd-icon-btn { background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: 4px; border-radius: 4px; }
         .sd-icon-btn:hover { color: var(--text); background: var(--surface-2); }
         .sd-icon-btn.danger:hover { color: var(--red); }
+        .sd-icon-btn.sale:hover { color: var(--teal); }
 
-        .sd-empty {
-          text-align: center; padding: 60px 20px; color: var(--text-muted);
-        }
+        .sd-empty { text-align: center; padding: 60px 20px; color: var(--text-muted); }
         .sd-empty h3 { color: var(--text); font-family: 'Oswald', sans-serif; text-transform: uppercase; margin: 12px 0 6px; }
 
-        .sd-modal-overlay {
-          position: fixed; inset: 0; background: rgba(0,0,0,0.6);
-          display: flex; align-items: center; justify-content: center;
-          z-index: 50; padding: 16px;
-        }
-        .sd-modal {
-          background: var(--surface); border: 1px solid var(--border);
-          border-radius: 10px; padding: 22px; width: 100%; max-width: 420px;
-          max-height: 90vh; overflow-y: auto;
-        }
+        .sd-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 16px; }
+        .sd-modal { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 22px; width: 100%; max-width: 420px; max-height: 90vh; overflow-y: auto; }
         .sd-modal h2 { font-family: 'Oswald', sans-serif; text-transform: uppercase; font-size: 18px; margin: 0 0 16px; }
         .sd-field { margin-bottom: 12px; }
         .sd-field label { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
-        .sd-field input {
-          width: 100%; background: var(--surface-2); border: 1px solid var(--border);
-          color: var(--text); border-radius: 6px; padding: 8px 10px; font-size: 14px;
-        }
+        .sd-field input { width: 100%; background: var(--surface-2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 10px; font-size: 14px; }
         .sd-field input:focus { outline: 2px solid var(--amber); outline-offset: 1px; border-color: var(--amber); }
         .sd-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-        .sd-form-error {
-          background: rgba(229,72,77,0.12); color: var(--red); border: 1px solid rgba(229,72,77,0.3);
-          padding: 8px 10px; border-radius: 6px; font-size: 13px; margin-bottom: 12px;
-        }
+        .sd-form-error { background: rgba(229,72,77,0.12); color: var(--red); border: 1px solid rgba(229,72,77,0.3); padding: 8px 10px; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }
         .sd-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
-        .sd-btn-secondary {
-          background: transparent; border: 1px solid var(--border); color: var(--text);
-          padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
-        }
-        .sd-btn-primary {
-          background: var(--amber); border: none; color: #14161c; font-weight: 600;
-          padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
-        }
+        .sd-btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+        .sd-btn-primary { background: var(--amber); border: none; color: #14161c; font-weight: 600; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
 
-        .sd-confirm {
-          position: absolute; background: var(--surface-2); border: 1px solid var(--border);
-          border-radius: 8px; padding: 10px; z-index: 10; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-        }
-        .sd-save-error {
-          background: rgba(229,72,77,0.12); color: var(--red); border: 1px solid rgba(229,72,77,0.3);
-          padding: 8px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 16px;
-        }
+        .sd-confirm { position: absolute; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; z-index: 10; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
+        .sd-save-error { background: rgba(229,72,77,0.12); color: var(--red); border: 1px solid rgba(229,72,77,0.3); padding: 8px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 16px; }
+
+        .sd-sale-summary { background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-bottom: 14px; font-size: 13px; }
+        .sd-sale-summary .row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+        .sd-sale-summary .row:last-child { margin-bottom: 0; font-weight: 600; color: var(--teal); }
+
+        .sd-range-tabs { display: flex; gap: 4px; }
+        .sd-range-btn { background: var(--surface); border: 1px solid var(--border); color: var(--text-muted); padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+        .sd-range-btn.active { background: var(--surface-2); color: var(--amber); border-color: var(--amber); }
       `}</style>
 
       <div className="sd-header">
@@ -378,146 +350,205 @@ export default function StockDashboard() {
           <Boxes size={26} color="var(--amber)" />
           <div>
             <h1 className="sd-display">Stock Control</h1>
-            <div className="sub sd-mono">{loaded ? `${products.length} item${products.length === 1 ? "" : "s"} tracked` : "loading…"}</div>
+            <div className="sub sd-mono">{products.length} item{products.length === 1 ? "" : "s"} tracked</div>
           </div>
         </div>
-        <button className="sd-add-btn" onClick={openAdd}>
-          <Plus size={16} /> Add Item
-        </button>
+        <button className="sd-add-btn" onClick={openAdd}><Plus size={16} /> Add Item</button>
       </div>
 
       {saveError && <div className="sd-save-error">{saveError}</div>}
 
-      {loaded && criticalItems.length > 0 && (
-        <div className="sd-ticker">
-          <span className="sd-ticker-dot" aria-hidden="true" />
-          <div className="sd-ticker-track">
-            <div className="sd-ticker-inner">
-              {Array(2).fill(criticalItems.map((p) =>
-                `${statusOf(p) === "out" ? "OUT OF STOCK" : "REORDER"}: ${p.name} (${p.sku}) — ${p.quantity} units`
-              ).join("   //   ")).join("   //   ")}
+      <div className="sd-tabs">
+        <button className={`sd-tab ${view === "inventory" ? "active" : ""}`} onClick={() => setView("inventory")}>
+          <Package size={14} /> Inventory
+        </button>
+        <button className={`sd-tab ${view === "sales" ? "active" : ""}`} onClick={() => setView("sales")}>
+          <TrendingUp size={14} /> Sales
+        </button>
+      </div>
+
+      {view === "inventory" && (
+        <>
+          {criticalItems.length > 0 && (
+            <div className="sd-ticker">
+              <span className="sd-ticker-dot" aria-hidden="true" />
+              <div className="sd-ticker-track">
+                <div className="sd-ticker-inner">
+                  {Array(2).fill(criticalItems.map((p) =>
+                    `${statusOf(p) === "out" ? "OUT OF STOCK" : "REORDER"}: ${p.name} (${p.sku}) — ${p.quantity} units`
+                  ).join("   //   ")).join("   //   ")}
+                </div>
+              </div>
+            </div>
+          )}
+          {criticalItems.length === 0 && products.length > 0 && (
+            <div className="sd-ticker">
+              <CircleCheck size={16} color="var(--teal)" />
+              <span className="sd-ticker-ok">All items are above their reorder point.</span>
+            </div>
+          )}
+
+          <div className="sd-stats">
+            <div className="sd-stat"><div className="val sd-mono">{stats.skus}</div><div className="lbl">SKUs</div></div>
+            <div className="sd-stat"><div className="val sd-mono">{stats.totalUnits}</div><div className="lbl">Total units</div></div>
+            <div className="sd-stat"><div className="val sd-mono">{currency(stats.totalValue)}</div><div className="lbl">Inventory value</div></div>
+            <div className="sd-stat"><div className="val sd-mono" style={{ color: "var(--amber)" }}>{stats.low}</div><div className="lbl">Needs reorder</div></div>
+            <div className="sd-stat"><div className="val sd-mono" style={{ color: "var(--red)" }}>{stats.out}</div><div className="lbl">Out of stock</div></div>
+          </div>
+
+          <div className="sd-toolbar">
+            <div className="sd-search">
+              <Search size={15} color="#8891a0" />
+              <input placeholder="Search by name or SKU…" value={search} onChange={(e) => setSearch(e.target.value)} />
+            </div>
+            <select className="sd-select" value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
+              {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <select className="sd-select" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+              <option value="All">All statuses</option>
+              <option value="healthy">Healthy</option>
+              <option value="low">Reorder</option>
+              <option value="out">Out of stock</option>
+            </select>
+          </div>
+
+          {products.length === 0 ? (
+            <div className="sd-empty">
+              <Package size={40} color="#8891a0" />
+              <h3>No items yet</h3>
+              <p>Add your first item to start tracking stock levels.</p>
+              <button className="sd-add-btn" style={{ margin: "10px auto 0" }} onClick={openAdd}><Plus size={16} /> Add Item</button>
+            </div>
+          ) : filtered.length === 0 ? (
+            <div className="sd-empty">
+              <Search size={32} color="#8891a0" />
+              <h3>No matches</h3>
+              <p>Try a different search or filter.</p>
+            </div>
+          ) : (
+            <div className="sd-table-wrap">
+              <table className="sd-table">
+                <thead>
+                  <tr>
+                    <SortTh label="Item" k="name" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                    <SortTh label="SKU" k="sku" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                    <SortTh label="Category" k="category" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                    <SortTh label="Stock" k="quantity" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                    <th>Status</th>
+                    <SortTh label="Unit price" k="unitPrice" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
+                    <th>Value</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map((p) => {
+                    const status = statusOf(p);
+                    const meta = STATUS_META[status];
+                    const max = Math.max(p.reorderPoint * 2, p.quantity, 1);
+                    const pct = Math.min(100, (p.quantity / max) * 100);
+                    return (
+                      <tr key={p.id}>
+                        <td>
+                          <div style={{ fontWeight: 600 }}>{p.name}</div>
+                          {p.location && <div className="sd-mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>{p.location}</div>}
+                        </td>
+                        <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{p.sku}</td>
+                        <td>{p.category}</td>
+                        <td>
+                          <div className="sd-qty-controls">
+                            <button className="sd-qty-btn" onClick={() => adjustQty(p.id, -1)} aria-label={`Decrease ${p.name} quantity`}><ChevronDown size={13} /></button>
+                            <span className="sd-mono" style={{ minWidth: 28, textAlign: "center" }}>{p.quantity}</span>
+                            <button className="sd-qty-btn" onClick={() => adjustQty(p.id, 1)} aria-label={`Increase ${p.name} quantity`}><ChevronUp size={13} /></button>
+                          </div>
+                          <div className="sd-gauge-wrap" style={{ marginTop: 6 }}>
+                            <div className="sd-gauge"><div className="sd-gauge-fill" style={{ width: `${pct}%`, background: meta.color }} /></div>
+                          </div>
+                        </td>
+                        <td>
+                          <span className="sd-badge" style={{ color: meta.color, background: meta.bg }}>
+                            {status === "out" && <AlertTriangle size={11} />}
+                            {status === "low" && <CircleAlert size={11} />}
+                            {status === "healthy" && <CircleCheck size={11} />}
+                            {meta.label}
+                          </span>
+                        </td>
+                        <td className="sd-mono">{currency(p.unitPrice)}</td>
+                        <td className="sd-mono">{currency(p.quantity * p.unitPrice)}</td>
+                        <td>
+                          <div style={{ display: "flex", gap: 2, position: "relative" }}>
+                            <button className="sd-icon-btn sale" onClick={() => openSaleModal(p)} aria-label={`Record sale of ${p.name}`} disabled={p.quantity <= 0} title="Record sale"><ShoppingCart size={14} /></button>
+                            <button className="sd-icon-btn" onClick={() => openEdit(p)} aria-label={`Edit ${p.name}`}><Pencil size={14} /></button>
+                            <button className="sd-icon-btn danger" onClick={() => setConfirmDeleteId(p.id)} aria-label={`Delete ${p.name}`}><Trash2 size={14} /></button>
+                            {confirmDeleteId === p.id && (
+                              <div className="sd-confirm" style={{ right: 0, top: 28 }}>
+                                <div style={{ fontSize: 12, marginBottom: 8, whiteSpace: "nowrap" }}>Delete "{p.name}"?</div>
+                                <div style={{ display: "flex", gap: 6 }}>
+                                  <button className="sd-btn-secondary" style={{ padding: "4px 10px" }} onClick={() => setConfirmDeleteId(null)}>Cancel</button>
+                                  <button className="sd-btn-primary" style={{ padding: "4px 10px", background: "var(--red)" }} onClick={() => deleteProduct(p.id)}>Delete</button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+
+      {view === "sales" && (
+        <>
+          <div className="sd-toolbar" style={{ justifyContent: "space-between" }}>
+            <div className="sd-range-tabs">
+              {[["all", "All time"], ["today", "Today"], ["week", "This week"], ["month", "This month"]].map(([k, label]) => (
+                <button key={k} className={`sd-range-btn ${salesRange === k ? "active" : ""}`} onClick={() => setSalesRange(k)}>{label}</button>
+              ))}
             </div>
           </div>
-        </div>
-      )}
-      {loaded && criticalItems.length === 0 && products.length > 0 && (
-        <div className="sd-ticker">
-          <CircleCheck size={16} color="var(--teal)" />
-          <span className="sd-ticker-ok">All items are above their reorder point.</span>
-        </div>
-      )}
 
-      <div className="sd-stats">
-        <div className="sd-stat"><div className="val sd-mono">{stats.skus}</div><div className="lbl">SKUs</div></div>
-        <div className="sd-stat"><div className="val sd-mono">{stats.totalUnits}</div><div className="lbl">Total units</div></div>
-        <div className="sd-stat"><div className="val sd-mono">{currency(stats.totalValue)}</div><div className="lbl">Inventory value</div></div>
-        <div className="sd-stat"><div className="val sd-mono" style={{ color: "var(--amber)" }}>{stats.low}</div><div className="lbl">Needs reorder</div></div>
-        <div className="sd-stat"><div className="val sd-mono" style={{ color: "var(--red)" }}>{stats.out}</div><div className="lbl">Out of stock</div></div>
-      </div>
+          <div className="sd-stats">
+            <div className="sd-stat"><div className="val sd-mono">{salesStats.count}</div><div className="lbl">Sales logged</div></div>
+            <div className="sd-stat"><div className="val sd-mono">{salesStats.units}</div><div className="lbl">Units sold</div></div>
+            <div className="sd-stat"><div className="val sd-mono" style={{ color: "var(--teal)" }}>{currency(salesStats.revenue)}</div><div className="lbl">Revenue</div></div>
+          </div>
 
-      <div className="sd-toolbar">
-        <div className="sd-search">
-          <Search size={15} color="#8891a0" />
-          <input placeholder="Search by name or SKU…" value={search} onChange={(e) => setSearch(e.target.value)} />
-        </div>
-        <select className="sd-select" value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
-          {categories.map((c) => <option key={c} value={c}>{c}</option>)}
-        </select>
-        <select className="sd-select" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-          <option value="All">All statuses</option>
-          <option value="healthy">Healthy</option>
-          <option value="low">Reorder</option>
-          <option value="out">Out of stock</option>
-        </select>
-      </div>
-
-      {!loaded ? (
-        <div className="sd-empty">Loading your inventory…</div>
-      ) : products.length === 0 ? (
-        <div className="sd-empty">
-          <Package size={40} color="#8891a0" />
-          <h3>No items yet</h3>
-          <p>Add your first item to start tracking stock levels.</p>
-          <button className="sd-add-btn" style={{ margin: "10px auto 0" }} onClick={openAdd}>
-            <Plus size={16} /> Add Item
-          </button>
-        </div>
-      ) : filtered.length === 0 ? (
-        <div className="sd-empty">
-          <Search size={32} color="#8891a0" />
-          <h3>No matches</h3>
-          <p>Try a different search or filter.</p>
-        </div>
-      ) : (
-        <div className="sd-table-wrap">
-          <table className="sd-table">
-            <thead>
-              <tr>
-                <SortTh label="Item" k="name" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
-                <SortTh label="SKU" k="sku" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
-                <SortTh label="Category" k="category" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
-                <SortTh label="Stock" k="quantity" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
-                <th>Status</th>
-                <SortTh label="Unit price" k="unitPrice" sortKey={sortKey} sortDir={sortDir} onClick={toggleSort} />
-                <th>Value</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.map((p) => {
-                const status = statusOf(p);
-                const meta = STATUS_META[status];
-                const max = Math.max(p.reorderPoint * 2, p.quantity, 1);
-                const pct = Math.min(100, (p.quantity / max) * 100);
-                return (
-                  <tr key={p.id}>
-                    <td>
-                      <div style={{ fontWeight: 600 }}>{p.name}</div>
-                      {p.location && <div className="sd-mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>{p.location}</div>}
-                    </td>
-                    <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{p.sku}</td>
-                    <td>{p.category}</td>
-                    <td>
-                      <div className="sd-qty-controls">
-                        <button className="sd-qty-btn" onClick={() => adjustQty(p.id, -1)} aria-label={`Decrease ${p.name} quantity`}><ChevronDown size={13} /></button>
-                        <span className="sd-mono" style={{ minWidth: 28, textAlign: "center" }}>{p.quantity}</span>
-                        <button className="sd-qty-btn" onClick={() => adjustQty(p.id, 1)} aria-label={`Increase ${p.name} quantity`}><ChevronUp size={13} /></button>
-                      </div>
-                      <div className="sd-gauge-wrap" style={{ marginTop: 6 }}>
-                        <div className="sd-gauge"><div className="sd-gauge-fill" style={{ width: `${pct}%`, background: meta.color }} /></div>
-                      </div>
-                    </td>
-                    <td>
-                      <span className="sd-badge" style={{ color: meta.color, background: meta.bg }}>
-                        {status === "out" && <AlertTriangle size={11} />}
-                        {status === "low" && <CircleAlert size={11} />}
-                        {status === "healthy" && <CircleCheck size={11} />}
-                        {meta.label}
-                      </span>
-                    </td>
-                    <td className="sd-mono">{currency(p.unitPrice)}</td>
-                    <td className="sd-mono">{currency(p.quantity * p.unitPrice)}</td>
-                    <td>
-                      <div style={{ display: "flex", gap: 2, position: "relative" }}>
-                        <button className="sd-icon-btn" onClick={() => openEdit(p)} aria-label={`Edit ${p.name}`}><Pencil size={14} /></button>
-                        <button className="sd-icon-btn danger" onClick={() => setConfirmDeleteId(p.id)} aria-label={`Delete ${p.name}`}><Trash2 size={14} /></button>
-                        {confirmDeleteId === p.id && (
-                          <div className="sd-confirm" style={{ right: 0, top: 28 }}>
-                            <div style={{ fontSize: 12, marginBottom: 8, whiteSpace: "nowrap" }}>Delete "{p.name}"?</div>
-                            <div style={{ display: "flex", gap: 6 }}>
-                              <button className="sd-btn-secondary" style={{ padding: "4px 10px" }} onClick={() => setConfirmDeleteId(null)}>Cancel</button>
-                              <button className="sd-btn-primary" style={{ padding: "4px 10px", background: "var(--red)" }} onClick={() => deleteProduct(p.id)}>Delete</button>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    </td>
+          {salesInRange.length === 0 ? (
+            <div className="sd-empty">
+              <ShoppingCart size={36} color="#8891a0" />
+              <h3>No sales in this range</h3>
+              <p>Use the cart icon next to an item in Inventory to log a sale.</p>
+            </div>
+          ) : (
+            <div className="sd-table-wrap">
+              <table className="sd-table">
+                <thead>
+                  <tr>
+                    <th>Date</th><th>Item</th><th>SKU</th><th>Qty</th><th>Unit price</th><th>Total</th><th></th>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+                </thead>
+                <tbody>
+                  {salesInRange.map((s) => (
+                    <tr key={s.id}>
+                      <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{new Date(s.date).toLocaleString()}</td>
+                      <td style={{ fontWeight: 600 }}>{s.productName}</td>
+                      <td className="sd-mono" style={{ color: "var(--text-muted)" }}>{s.sku}</td>
+                      <td className="sd-mono">{s.quantity}</td>
+                      <td className="sd-mono">{currency(s.unitPrice)}</td>
+                      <td className="sd-mono" style={{ color: "var(--teal)" }}>{currency(s.quantity * s.unitPrice)}</td>
+                      <td>
+                        <button className="sd-icon-btn danger" onClick={() => undoSale(s)} title="Undo this sale (restores stock)"><X size={14} /></button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
       )}
 
       {modalOpen && (
@@ -568,15 +599,37 @@ export default function StockDashboard() {
           </div>
         </div>
       )}
+
+      {saleModalProduct && (
+        <div className="sd-modal-overlay" onClick={() => setSaleModalProduct(null)}>
+          <div className="sd-modal" onClick={(e) => e.stopPropagation()}>
+            <h2>Record sale</h2>
+            {saleError && <div className="sd-form-error">{saleError}</div>}
+            <div className="sd-sale-summary">
+              <div className="row"><span>{saleModalProduct.name}</span><span className="sd-mono">{saleModalProduct.quantity} in stock</span></div>
+            </div>
+            <form onSubmit={submitSale}>
+              <div className="sd-field">
+                <label htmlFor="sd-sale-qty">Quantity sold</label>
+                <input id="sd-sale-qty" type="number" min="1" max={saleModalProduct.quantity} value={saleQty} onChange={(e) => setSaleQty(e.target.value)} autoFocus />
+              </div>
+              <div className="sd-sale-summary">
+                <div className="row"><span>Unit price</span><span className="sd-mono">{currency(saleModalProduct.unitPrice)}</span></div>
+                <div className="row"><span>Total</span><span className="sd-mono">{currency((Number(saleQty) || 0) * saleModalProduct.unitPrice)}</span></div>
+              </div>
+              <div className="sd-modal-actions">
+                <button type="button" className="sd-btn-secondary" onClick={() => setSaleModalProduct(null)}>Cancel</button>
+                <button type="submit" className="sd-btn-primary">Record sale</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 function SortTh({ label, k, sortKey, sortDir, onClick }) {
   const active = sortKey === k;
-  return (
-    <th onClick={() => onClick(k)}>
-      {label} {active && (sortDir === "asc" ? "↑" : "↓")}
-    </th>
-  );
+  return (<th onClick={() => onClick(k)}>{label} {active && (sortDir === "asc" ? "↑" : "↓")}</th>);
 }
